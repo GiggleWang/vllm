@@ -37,11 +37,14 @@ from vllm.v1.core.encoder_cache_manager import (
     EncoderDecoderCacheManager,
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.sched.interface import SchedulerInterface
+from vllm.v1.core.kv_cache_compression import CompressionPolicyConfig
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
+    KVCompressionInstruction,
     NewRequestData,
     SchedulerOutput,
 )
@@ -237,6 +240,28 @@ class Scheduler(SchedulerInterface):
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
 
+        # KV cache compression config
+        self.kv_compression_config: CompressionPolicyConfig | None = None
+        if self.cache_config.kv_compression_policy is not None:
+            self.kv_compression_config = CompressionPolicyConfig(
+                policy_type=self.cache_config.kv_compression_policy,
+                keep_ratio=self.cache_config.kv_compression_ratio,
+                keep_first=self.cache_config.kv_compression_keep_first,
+                keep_last=self.cache_config.kv_compression_keep_last,
+            )
+            logger.info(
+                "KV cache compression enabled: policy=%s, ratio=%.1f%%, "
+                "keep_first=%d, keep_last=%d",
+                self.kv_compression_config.policy_type,
+                self.kv_compression_config.keep_ratio * 100,
+                self.kv_compression_config.keep_first,
+                self.kv_compression_config.keep_last,
+            )
+        # Blocks whose freeing is deferred until the next schedule() round.
+        # This avoids a race condition where the scheduler frees blocks that
+        # the worker still needs to read during KV cache compression.
+        self._pending_free_blocks: list[KVCacheBlock] = []
+
         def has_mamba_layers(kv_cache_config: KVCacheConfig) -> bool:
             return any(
                 isinstance(group_spec.kv_cache_spec, MambaSpec)
@@ -329,6 +354,25 @@ class Scheduler(SchedulerInterface):
         # num_tokens_with_spec. This is general enough to cover
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
+
+        # Free blocks that were deferred from the previous round's
+        # KV cache compression.  By this point the worker has finished
+        # reading the old block data, so it is safe to recycle them.
+        if self._pending_free_blocks:
+            num_freed = len(self._pending_free_blocks)
+            self.kv_cache_manager.block_pool.free_blocks(
+                self._pending_free_blocks)
+            self._pending_free_blocks.clear()
+            logger.debug(
+                "Released %d deferred KV blocks to pool",
+                num_freed,
+            )
+
+        # Process pending KV cache compressions before scheduling.
+        kv_compression_instructions: list[KVCompressionInstruction] = []
+        if self.kv_compression_config is not None:
+            kv_compression_instructions = (
+                self._process_pending_compressions())
 
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
@@ -874,6 +918,7 @@ class Scheduler(SchedulerInterface):
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+            kv_compression_instructions=kv_compression_instructions,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -919,6 +964,115 @@ class Scheduler(SchedulerInterface):
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
 
+    # ---- KV cache compression helpers ----
+
+    def _process_pending_compressions(
+        self,
+    ) -> list[KVCompressionInstruction]:
+        """Plan and apply KV cache compressions for requests that just
+        finished prefill.
+
+        Called at the beginning of schedule() so that metadata is updated
+        before the main scheduling loop.
+        """
+        assert self.kv_compression_config is not None
+        instructions: list[KVCompressionInstruction] = []
+        for request in self.running:
+            if not request.needs_kv_compression:
+                continue
+            request.needs_kv_compression = False
+
+            original_len = request.num_computed_tokens
+            config = self.kv_compression_config
+            compressed_len = self._compute_compressed_len(
+                original_len, config)
+
+            if compressed_len >= original_len:
+                continue
+
+            # NOTE: We do NOT modify request.num_computed_tokens here!
+            # That would break input token reading logic. The compression
+            # only affects KV cache blocks, not logical token counts.
+
+            # Update block management and build instruction.
+            instruction = self._build_compression_instruction(
+                request, original_len, compressed_len, config)
+            instructions.append(instruction)
+
+            logger.info(
+                "KV cache compressed req %s: %d -> %d tokens (%.1f%%)",
+                request.request_id[:8],
+                original_len,
+                compressed_len,
+                100.0 * compressed_len / original_len if original_len > 0 else 0.0,
+            )
+        return instructions
+
+    @staticmethod
+    def _compute_compressed_len(
+        original_len: int,
+        config: CompressionPolicyConfig,
+    ) -> int:
+        """Compute the target compressed sequence length."""
+        from vllm.utils.math_utils import cdiv  # noqa: F811
+        target = max(
+            config.keep_first + config.keep_last,
+            int(original_len * config.keep_ratio),
+        )
+        return min(target, original_len)
+
+    def _build_compression_instruction(
+        self,
+        request: Request,
+        original_len: int,
+        compressed_len: int,
+        config: CompressionPolicyConfig,
+    ) -> KVCompressionInstruction:
+        """Update block tracking and create a compression instruction."""
+        from vllm.utils.math_utils import cdiv  # noqa: F811
+
+        new_block_ids_per_group: list[list[int]] = []
+        coordinator = self.kv_cache_manager.coordinator
+        total_blocks_freed = 0
+        for manager in coordinator.single_type_managers:
+            block_size = manager.block_size
+            old_blocks = manager.req_to_blocks[request.request_id]
+            new_num_blocks = cdiv(compressed_len, block_size)
+
+            blocks_to_keep = list(old_blocks[:new_num_blocks])
+            blocks_to_free = list(old_blocks[new_num_blocks:])
+            manager.req_to_blocks[request.request_id] = blocks_to_keep
+
+            # Defer freeing until the next schedule() round so that the
+            # worker can still read the old block data for compression.
+            # Reverse order preserves LRU eviction priority.
+            self._pending_free_blocks.extend(reversed(blocks_to_free))
+            total_blocks_freed += len(blocks_to_free)
+
+            # Invalidate block hashes — compressed blocks can't serve
+            # as prefix cache hits since their contents are rearranged.
+            for block in blocks_to_keep:
+                block.reset_hash()
+            manager.num_cached_block[request.request_id] = 0
+
+            new_block_ids_per_group.append(
+                [b.block_id for b in blocks_to_keep])
+
+        logger.debug(
+            "Req %s: freed %d KV blocks (deferred)",
+            request.request_id[:8],
+            total_blocks_freed,
+        )
+
+        return KVCompressionInstruction(
+            req_id=request.request_id,
+            compressed_len=compressed_len,
+            new_block_ids=tuple(new_block_ids_per_group),
+            policy_type=config.policy_type,
+            keep_first=config.keep_first,
+            keep_last=config.keep_last,
+        )
+
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
         # the request is scheduled.
@@ -932,13 +1086,28 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
+            was_prefill = request.is_prefill_chunk
+            old_num_computed = request.num_computed_tokens
             request.num_computed_tokens += num_scheduled_token
-            request.is_prefill_chunk = request.num_computed_tokens < (
+            new_is_prefill = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
             )
+            request.is_prefill_chunk = new_is_prefill
             scheduler_output.has_structured_output_requests |= (
                 request.use_structured_output
             )
+
+            # Detect prefill→decode transition for KV cache compression.
+            # This happens when:
+            # 1. Request just finished prefill (transitioned from prefill to decode)
+            # 2. OR request completed all prefill tokens in one shot (old_num_computed==0)
+            is_completing_prefill = (
+                (was_prefill and not new_is_prefill) or
+                (old_num_computed == 0 and not new_is_prefill)
+            )
+            if (is_completing_prefill
+                    and self.kv_compression_config is not None):
+                request.needs_kv_compression = True
 
             # NOTE: _free_encoder_inputs relies on num_computed_tokens, which
             # may be updated again in _update_from_output for speculative

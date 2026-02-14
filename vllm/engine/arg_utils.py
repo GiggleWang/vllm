@@ -586,6 +586,12 @@ class EngineArgs:
 
     kv_offloading_size: float | None = CacheConfig.kv_offloading_size
     kv_offloading_backend: KVOffloadingBackend = CacheConfig.kv_offloading_backend
+
+    kv_compression_policy: str | None = CacheConfig.kv_compression_policy
+    kv_compression_ratio: float = CacheConfig.kv_compression_ratio
+    kv_compression_keep_first: int = CacheConfig.kv_compression_keep_first
+    kv_compression_keep_last: int = CacheConfig.kv_compression_keep_last
+
     tokens_only: bool = False
 
     weight_transfer_config: WeightTransferConfig | None = get_field(
@@ -968,6 +974,22 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--kv-offloading-backend", **cache_kwargs["kv_offloading_backend"]
+        )
+        cache_group.add_argument(
+            "--kv-compression-policy",
+            **cache_kwargs["kv_compression_policy"],
+        )
+        cache_group.add_argument(
+            "--kv-compression-ratio",
+            **cache_kwargs["kv_compression_ratio"],
+        )
+        cache_group.add_argument(
+            "--kv-compression-keep-first",
+            **cache_kwargs["kv_compression_keep_first"],
+        )
+        cache_group.add_argument(
+            "--kv-compression-keep-last",
+            **cache_kwargs["kv_compression_keep_last"],
         )
 
         # Multimodal related configs
@@ -1455,6 +1477,10 @@ class EngineArgs:
             mamba_cache_mode=self.mamba_cache_mode,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
+            kv_compression_policy=self.kv_compression_policy,
+            kv_compression_ratio=self.kv_compression_ratio,
+            kv_compression_keep_first=self.kv_compression_keep_first,
+            kv_compression_keep_last=self.kv_compression_keep_last,
         )
 
         ray_runtime_env = None

@@ -18,7 +18,13 @@ from vllm.model_executor.model_loader import get_model_loader
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
-from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.attention.ops.kv_compact import compact_kv_cache
+from vllm.v1.core.kv_cache_compression import get_compression_policy
+from vllm.v1.core.sched.output import (
+    GrammarOutput,
+    KVCompressionInstruction,
+    SchedulerOutput,
+)
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.gpu.async_utils import AsyncOutput
@@ -255,6 +261,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.attn_backends,
             self.device,
         )
+        # Dict mapping layer_name -> kv_cache tensor (used by compression).
+        self.kv_caches_dict = kv_caches_dict
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
         # Attention groups are not supported.
@@ -495,6 +503,89 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.block_tables.append_block_ids(
                     req_index, req_new_block_ids, overwrite=False
                 )
+
+    def _apply_kv_compressions(
+        self,
+        instructions: list[KVCompressionInstruction],
+    ) -> None:
+        """Apply physical KV cache compression on GPU.
+
+        For each instruction:
+        1. Run the compression policy to select which tokens to keep.
+        2. Compact the KV entries into contiguous positions.
+        3. Overwrite the block table with the compressed block IDs.
+        4. Update worker-side metadata.
+        """
+        kv_cache_groups = self.kv_cache_config.kv_cache_groups
+
+        for instr in instructions:
+            req_index = self.req_states.req_id_to_index[instr.req_id]
+            original_len = int(self.req_states.prefill_len.np[req_index])
+
+            logger.debug(
+                "Compressing KV cache for req %s: %d -> %d tokens",
+                instr.req_id[:8],
+                original_len,
+                instr.compressed_len,
+            )
+
+            # Get compression policy.
+            policy = get_compression_policy(instr.policy_type)
+
+            # Process each KV cache group.
+            for group_idx, group in enumerate(kv_cache_groups):
+                block_size = group.kv_cache_spec.block_size
+
+                # Read the old block IDs from the GPU block table.
+                num_old_blocks = int(
+                    self.block_tables.num_blocks.np[group_idx, req_index])
+                old_block_ids_gpu = self.block_tables.block_tables[
+                    group_idx].gpu[req_index, :num_old_blocks]
+                old_block_ids = old_block_ids_gpu.cpu().tolist()
+
+                # Determine kept_indices once per group (using first layer).
+                first_layer = group.layer_names[0]
+                kv_cache = self.kv_caches_dict[first_layer]
+                kept_indices = policy.select_tokens_to_keep(
+                    kv_cache=kv_cache,
+                    block_ids=old_block_ids,
+                    seq_len=original_len,
+                    target_len=instr.compressed_len,
+                    block_size=block_size,
+                    keep_first=instr.keep_first,
+                    keep_last=instr.keep_last,
+                )
+
+                # Apply compaction to all layers in this group.
+                for layer_name in group.layer_names:
+                    kv_cache = self.kv_caches_dict[layer_name]
+                    compact_kv_cache(
+                        kv_cache, old_block_ids, kept_indices, block_size)
+
+                # Overwrite the block table directly on GPU.
+                new_ids = instr.new_block_ids[group_idx]
+                new_ids_tensor = torch.tensor(
+                    new_ids,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                bt = self.block_tables.block_tables[group_idx].gpu
+                bt[req_index, :len(new_ids)] = new_ids_tensor
+                self.block_tables.num_blocks.np[
+                    group_idx, req_index] = len(new_ids)
+
+            # Update num_blocks UVA buffer so GPU sees the change.
+            self.block_tables.num_blocks.copy_to_uva()
+
+            # NOTE: We do NOT update num_computed_tokens, prefill_len, etc.
+            # on the worker side. These are used to read input tokens from
+            # prefill_token_ids and should remain unchanged. The scheduler
+            # has already updated its side to reflect the compression.
+
+            logger.debug(
+                "KV cache compression complete for req %s",
+                instr.req_id[:8],
+            )
 
     def prepare_inputs(
         self, scheduler_output: SchedulerOutput, num_tokens_after_padding: int
@@ -808,6 +899,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
             self.block_tables.apply_staged_writes()
+
+            # Apply KV cache compressions after block tables are committed.
+            if scheduler_output.kv_compression_instructions:
+                self._apply_kv_compressions(
+                    scheduler_output.kv_compression_instructions)
+
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
