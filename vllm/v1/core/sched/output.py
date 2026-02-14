@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -179,6 +179,22 @@ class CachedRequestData:
         )
 
 
+@dataclass
+class KVCompressionInstruction:
+    """Instructions for the worker to physically compress a request's KV cache.
+
+    Sent from scheduler to worker as part of SchedulerOutput.
+    The scheduler computes the target compressed length and block management;
+    the worker runs the GPU-side compression policy and data movement.
+    """
+    req_id: str
+    compressed_len: int  # Target number of tokens to keep
+    new_block_ids: tuple[list[int], ...]  # Per KV cache group: retained block IDs
+    policy_type: str  # "knorm", "streaming_llm", etc.
+    keep_first: int  # Always keep first N tokens (attention sinks)
+    keep_last: int  # Always keep last N tokens (recent context)
+
+
 @bc_linter_include
 @dataclass
 class SchedulerOutput:
@@ -237,6 +253,10 @@ class SchedulerOutput:
 
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
+
+    # KV cache compression instructions to apply before model execution.
+    kv_compression_instructions: list[KVCompressionInstruction] = field(
+        default_factory=list)
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

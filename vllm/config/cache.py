@@ -168,6 +168,23 @@ class CacheConfig:
     'native' (vLLM native CPU offloading), 'lmcache'.
     KV offloading is only activated when kv_offloading_size is set."""
 
+    # KV cache compression
+    kv_compression_policy: str | None = None
+    """Compression policy to apply to KV cache after prefill. Supported
+    policies: 'knorm', 'streaming_llm', 'expected_attention', 'think',
+    'keydiff', 'lagkv'. When set, KV cache is physically compressed between
+    prefill and decode, freeing GPU memory blocks."""
+
+    kv_compression_ratio: float = 0.5
+    """Fraction of tokens to keep after KV cache compression (0.0 to 1.0).
+    For example, 0.5 means keep 50% of tokens."""
+
+    kv_compression_keep_first: int = 4
+    """Number of initial tokens to always keep (attention sinks)."""
+
+    kv_compression_keep_last: int = 64
+    """Number of recent tokens to always keep."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

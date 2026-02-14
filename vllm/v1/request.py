@@ -135,6 +135,10 @@ class Request:
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
 
+        # KV cache compression
+        self.needs_kv_compression = False
+        self.kv_compression_offset = 0
+
         # Multi-modal related
         self.mm_features = mm_features or []
 
@@ -225,11 +229,12 @@ class Request:
 
     @property
     def num_tokens(self) -> int:
-        return len(self._all_token_ids)
+        return len(self._all_token_ids) - self.kv_compression_offset
 
     @property
     def num_tokens_with_spec(self) -> int:
-        return len(self._all_token_ids) + len(self.spec_token_ids)
+        return (len(self._all_token_ids) + len(self.spec_token_ids)
+                - self.kv_compression_offset)
 
     @property
     def num_output_tokens(self) -> int:
