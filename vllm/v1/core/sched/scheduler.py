@@ -370,8 +370,9 @@ class Scheduler(SchedulerInterface):
 
         # Process pending KV cache compressions before scheduling.
         kv_compression_instructions: list[KVCompressionInstruction] = []
+        compressed_req_ids: set[str] = set()
         if self.kv_compression_config is not None:
-            kv_compression_instructions = (
+            kv_compression_instructions, compressed_req_ids = (
                 self._process_pending_compressions())
 
         scheduled_new_reqs: list[Request] = []
@@ -897,6 +898,7 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens,
                 scheduled_spec_decode_tokens,
                 req_to_new_blocks,
+                compressed_req_ids,
             )
 
         # Record the request ids that were scheduled in this step.
@@ -968,15 +970,19 @@ class Scheduler(SchedulerInterface):
 
     def _process_pending_compressions(
         self,
-    ) -> list[KVCompressionInstruction]:
+    ) -> tuple[list[KVCompressionInstruction], set[str]]:
         """Plan and apply KV cache compressions for requests that just
         finished prefill.
 
         Called at the beginning of schedule() so that metadata is updated
         before the main scheduling loop.
+
+        Returns:
+            A tuple of (compression instructions, set of compressed request IDs).
         """
         assert self.kv_compression_config is not None
         instructions: list[KVCompressionInstruction] = []
+        compressed_req_ids: set[str] = set()
         for request in self.running:
             if not request.needs_kv_compression:
                 continue
@@ -998,6 +1004,7 @@ class Scheduler(SchedulerInterface):
             instruction = self._build_compression_instruction(
                 request, original_len, compressed_len, config)
             instructions.append(instruction)
+            compressed_req_ids.add(request.request_id)
 
             logger.info(
                 "KV cache compressed req %s: %d -> %d tokens (%.1f%%)",
@@ -1006,7 +1013,7 @@ class Scheduler(SchedulerInterface):
                 compressed_len,
                 100.0 * compressed_len / original_len if original_len > 0 else 0.0,
             )
-        return instructions
+        return instructions, compressed_req_ids
 
     @staticmethod
     def _compute_compressed_len(
@@ -1172,6 +1179,7 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens: dict[str, int],
         spec_decode_tokens: dict[str, list[int]],
         req_to_new_blocks: dict[str, KVCacheBlocks],
+        compressed_req_ids: set[str] | None = None,
     ) -> CachedRequestData:
         req_ids: list[str] = []
         new_token_ids: list[list[int]] = []
@@ -1180,6 +1188,8 @@ class Scheduler(SchedulerInterface):
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
         resumed_req_ids = set()
+        if compressed_req_ids is None:
+            compressed_req_ids = set()
 
         num_running_reqs = len(running_reqs)
         for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
@@ -1205,7 +1215,11 @@ class Scheduler(SchedulerInterface):
             if idx >= num_running_reqs:
                 assert not scheduled_in_prev_step
                 resumed_req_ids.add(req_id)
-            if not scheduled_in_prev_step:
+            # Requests that have undergone KV cache compression need to replace
+            # their block tables instead of appending.
+            elif req_id in compressed_req_ids:
+                resumed_req_ids.add(req_id)
+            if not scheduled_in_prev_step or req_id in compressed_req_ids:
                 all_token_ids[req_id] = req.all_token_ids.copy()
             new_block_ids.append(
                 req_to_new_blocks[req_id].get_block_ids(allow_none=True)
