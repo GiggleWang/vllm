@@ -257,10 +257,16 @@ class Scheduler(SchedulerInterface):
                 self.kv_compression_config.keep_first,
                 self.kv_compression_config.keep_last,
             )
-        # Blocks whose freeing is deferred until the next schedule() round.
-        # This avoids a race condition where the scheduler frees blocks that
-        # the worker still needs to read during KV cache compression.
-        self._pending_free_blocks: list[KVCacheBlock] = []
+        # KV blocks waiting to be freed, keyed by request_id.
+        # Populated in _build_compression_instruction() when a compression
+        # instruction is built; freed in update_from_output() once the worker
+        # has confirmed it finished reading the old block data.
+        # Using a dict (request_id → blocks) lets update_from_output() look up
+        # exactly which blocks correspond to each compression instruction,
+        # ensuring blocks are freed only after the worker completes the
+        # schedule() round that produced them — safe under async scheduling
+        # and pipeline parallelism where the scheduler runs ahead of the worker.
+        self._deferred_free_blocks: dict[str, list[KVCacheBlock]] = {}
 
         def has_mamba_layers(kv_cache_config: KVCacheConfig) -> bool:
             return any(
@@ -354,19 +360,6 @@ class Scheduler(SchedulerInterface):
         # num_tokens_with_spec. This is general enough to cover
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
-
-        # Free blocks that were deferred from the previous round's
-        # KV cache compression.  By this point the worker has finished
-        # reading the old block data, so it is safe to recycle them.
-        if self._pending_free_blocks:
-            num_freed = len(self._pending_free_blocks)
-            self.kv_cache_manager.block_pool.free_blocks(
-                self._pending_free_blocks)
-            self._pending_free_blocks.clear()
-            logger.debug(
-                "Released %d deferred KV blocks to pool",
-                num_freed,
-            )
 
         # Process pending KV cache compressions before scheduling.
         kv_compression_instructions: list[KVCompressionInstruction] = []
@@ -892,6 +885,16 @@ class Scheduler(SchedulerInterface):
             ]
 
         with record_function_or_nullcontext("schedule: make_cached_request_data"):
+            # Build a lookup of retained block IDs for compressed requests.
+            # These must be combined with any newly allocated decode blocks so
+            # that _update_states() can restore the full (retained + new) block
+            # table.  Without this, new_block_ids would be None when the next
+            # decode token fits inside an already-retained block, causing an
+            # AssertionError in _update_states().
+            compression_block_lookup: dict[str, tuple[list[int], ...]] = {
+                instr.req_id: instr.new_block_ids
+                for instr in kv_compression_instructions
+            }
             cached_reqs_data = self._make_cached_request_data(
                 scheduled_running_reqs,
                 scheduled_resumed_reqs,
@@ -899,6 +902,7 @@ class Scheduler(SchedulerInterface):
                 scheduled_spec_decode_tokens,
                 req_to_new_blocks,
                 compressed_req_ids,
+                compression_block_lookup,
             )
 
         # Record the request ids that were scheduled in this step.
@@ -1050,10 +1054,11 @@ class Scheduler(SchedulerInterface):
             blocks_to_free = list(old_blocks[new_num_blocks:])
             manager.req_to_blocks[request.request_id] = blocks_to_keep
 
-            # Defer freeing until the next schedule() round so that the
-            # worker can still read the old block data for compression.
+            # Defer freeing by request_id. update_from_output() will release
+            # these blocks once the worker confirms it finished this round.
             # Reverse order preserves LRU eviction priority.
-            self._pending_free_blocks.extend(reversed(blocks_to_free))
+            self._deferred_free_blocks.setdefault(
+                request.request_id, []).extend(reversed(blocks_to_free))
             total_blocks_freed += len(blocks_to_free)
 
             # Invalidate block hashes — compressed blocks can't serve
@@ -1180,6 +1185,8 @@ class Scheduler(SchedulerInterface):
         spec_decode_tokens: dict[str, list[int]],
         req_to_new_blocks: dict[str, KVCacheBlocks],
         compressed_req_ids: set[str] | None = None,
+        compression_block_lookup: dict[str,
+                                       tuple[list[int], ...]] | None = None,
     ) -> CachedRequestData:
         req_ids: list[str] = []
         new_token_ids: list[list[int]] = []
@@ -1190,6 +1197,8 @@ class Scheduler(SchedulerInterface):
         resumed_req_ids = set()
         if compressed_req_ids is None:
             compressed_req_ids = set()
+        if compression_block_lookup is None:
+            compression_block_lookup = {}
 
         num_running_reqs = len(running_reqs)
         for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
@@ -1221,9 +1230,26 @@ class Scheduler(SchedulerInterface):
                 resumed_req_ids.add(req_id)
             if not scheduled_in_prev_step or req_id in compressed_req_ids:
                 all_token_ids[req_id] = req.all_token_ids.copy()
-            new_block_ids.append(
-                req_to_new_blocks[req_id].get_block_ids(allow_none=True)
-            )
+            if req_id in compression_block_lookup:
+                # For compressed requests the new_block_ids must be the full
+                # set of blocks the request will use after compression:
+                # retained blocks (from the compression instruction) combined
+                # with any newly allocated decode blocks.  Using only the
+                # newly allocated blocks would drop the retained KV history;
+                # using None when no new block is needed triggers an
+                # AssertionError in _update_states().
+                retained = compression_block_lookup[req_id]
+                extra = req_to_new_blocks[req_id].get_block_ids(
+                    allow_none=True)
+                if extra is None:
+                    new_block_ids.append(retained)
+                else:
+                    combined = tuple(r + e for r, e in zip(retained, extra))
+                    new_block_ids.append(combined)
+            else:
+                new_block_ids.append(
+                    req_to_new_blocks[req_id].get_block_ids(allow_none=True)
+                )
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
@@ -1426,6 +1452,18 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        # Free KV blocks deferred from the schedule() round that produced
+        # scheduler_output. The worker has now finished reading the old block
+        # data for each compressed request, so it is safe to recycle them.
+        for instr in scheduler_output.kv_compression_instructions:
+            blocks = self._deferred_free_blocks.pop(instr.req_id, None)
+            if blocks:
+                self.kv_cache_manager.block_pool.free_blocks(blocks)
+                logger.debug(
+                    "Released %d deferred KV blocks for req %s",
+                    len(blocks), instr.req_id[:8],
+                )
+
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict

@@ -71,30 +71,28 @@ def main():
     # in sequence without running out of memory.
     gpu_mem_util = 0.9  # Only use 90% of GPU memory
 
-    # --- Run WITHOUT compression (baseline) ---
-    print("=" * 70)
-    print("Run 1: WITHOUT KV cache compression (baseline)")
-    print("=" * 70)
+    # # --- Run WITHOUT compression (baseline) ---
+    # print("=" * 70)
+    # print("Run 1: WITHOUT KV cache compression (baseline)")
+    # print("=" * 70)
 
-    llm_baseline = LLM(
-        model="facebook/opt-125m",
-        enforce_eager=True,
-        gpu_memory_utilization=gpu_mem_util,
-    )
-    outputs_baseline = llm_baseline.generate(PROMPTS, sampling_params)
+    # llm_baseline = LLM(
+    #     model="facebook/opt-125m"
+    # )
+    # outputs_baseline = llm_baseline.generate(PROMPTS, sampling_params)
 
-    for output in outputs_baseline:
-        prompt = output.prompt[:80] + "..." if len(output.prompt) > 80 else output.prompt
-        generated_text = output.outputs[0].text
-        print(f"Prompt:  {prompt!r}")
-        print(f"Output:  {generated_text!r}")
-        print("-" * 70)
+    # for output in outputs_baseline:
+    #     prompt = output.prompt[:80] + "..." if len(output.prompt) > 80 else output.prompt
+    #     generated_text = output.outputs[0].text
+    #     print(f"Prompt:  {prompt!r}")
+    #     print(f"Output:  {generated_text!r}")
+    #     print("-" * 70)
 
-    del llm_baseline
-    # Force garbage collection and CUDA cache cleanup
-    gc.collect()
-    torch.cuda.empty_cache()
-    print("\n[Cleaned up GPU memory]\n")
+    # del llm_baseline
+    # # Force garbage collection and CUDA cache cleanup
+    # gc.collect()
+    # torch.cuda.empty_cache()
+    # print("\n[Cleaned up GPU memory]\n")
 
     # --- Run WITH compression ---
     print("=" * 70)
@@ -123,18 +121,18 @@ def main():
     gc.collect()
     torch.cuda.empty_cache()
 
-    # --- Compare ---
-    print("\n" + "=" * 70)
-    print("Comparison")
-    print("=" * 70)
-    for i, (b, c) in enumerate(zip(outputs_baseline, outputs_compressed)):
-        b_text = b.outputs[0].text
-        c_text = c.outputs[0].text
-        match = "MATCH" if b_text == c_text else "DIFFER"
-        print(f"Prompt {i}: [{match}]")
-        if b_text != c_text:
-            print(f"  Baseline:   {b_text[:120]!r}")
-            print(f"  Compressed: {c_text[:120]!r}")
+    # # --- Compare ---
+    # print("\n" + "=" * 70)
+    # print("Comparison")
+    # print("=" * 70)
+    # for i, (b, c) in enumerate(zip(outputs_baseline, outputs_compressed)):
+    #     b_text = b.outputs[0].text
+    #     c_text = c.outputs[0].text
+    #     match = "MATCH" if b_text == c_text else "DIFFER"
+    #     print(f"Prompt {i}: [{match}]")
+    #     if b_text != c_text:
+    #         print(f"  Baseline:   {b_text[:120]!r}")
+    #         print(f"  Compressed: {c_text[:120]!r}")
 
 
 if __name__ == "__main__":

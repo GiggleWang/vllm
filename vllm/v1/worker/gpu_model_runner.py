@@ -119,7 +119,9 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
-from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.attention.ops.kv_compact import compact_kv_cache
+from vllm.v1.core.kv_cache_compression import get_compression_policy
+from vllm.v1.core.sched.output import KVCompressionInstruction, NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -3308,6 +3310,125 @@ class GPUModelRunner(
 
         return slot_mappings_by_gid, slot_mappings_by_layer
 
+    def _apply_kv_compressions(
+        self,
+        instructions: list[KVCompressionInstruction],
+    ) -> None:
+        """Apply physical KV cache compression on GPU.
+
+        Must be called BEFORE _update_states() so that the block table still
+        holds the original (pre-compression) block IDs needed for reading.
+
+        For each instruction:
+        1. Run the compression policy to select which tokens to keep.
+        2. Compact the KV entries into contiguous positions in the first N blocks.
+        3. The block table update (to compressed block IDs) is handled later by
+           _update_states(), which re-adds the request with the new block IDs.
+        """
+        kv_cache_groups = self.kv_cache_config.kv_cache_groups
+        print(f"[KV Compression] _apply_kv_compressions called with "
+              f"{len(instructions)} instruction(s)")
+
+        t_total_start = time.perf_counter()
+
+        for instr in instructions:
+            req_index = self.input_batch.req_id_to_index.get(instr.req_id)
+            if req_index is None:
+                print(f"[KV Compression] req {instr.req_id[:8]} not found in "
+                      f"batch, skipping")
+                continue
+
+            # Number of tokens in KV cache before compression.
+            original_len = int(
+                self.input_batch.num_computed_tokens_cpu[req_index])
+
+            print(f"[KV Compression] req={instr.req_id[:8]} "
+                  f"policy={instr.policy_type} "
+                  f"{original_len} -> {instr.compressed_len} tokens "
+                  f"(keep_first={instr.keep_first}, keep_last={instr.keep_last})")
+
+            logger.debug(
+                "Compressing KV cache for req %s: %d -> %d tokens",
+                instr.req_id[:8],
+                original_len,
+                instr.compressed_len,
+            )
+
+            policy = get_compression_policy(instr.policy_type)
+
+            # Use CUDA Events for GPU timing: records timestamps directly on
+            # the GPU timeline without stalling the CPU-GPU pipeline.
+            ev_select_start = torch.cuda.Event(enable_timing=True)
+            ev_select_end = torch.cuda.Event(enable_timing=True)
+            ev_compact_start = torch.cuda.Event(enable_timing=True)
+            ev_compact_end = torch.cuda.Event(enable_timing=True)
+
+            t_select_ms = 0.0
+            t_compact_ms = 0.0
+
+            for group_idx, group in enumerate(kv_cache_groups):
+                block_table = self.input_batch.block_table[group_idx]
+                block_size = group.kv_cache_spec.block_size
+
+                # Read the original block IDs from the CPU block table.
+                # These are the full pre-compression block IDs (including
+                # blocks that will be freed), which is required so the
+                # policy can read KV data from all original positions.
+                num_old_blocks = int(
+                    block_table.num_blocks_per_row[req_index])
+                old_block_ids = (
+                    block_table.block_table.np[
+                        req_index, :num_old_blocks].tolist())
+
+                print(f"[KV Compression]   group={group_idx} "
+                      f"block_size={block_size} "
+                      f"num_blocks: {num_old_blocks} -> "
+                      f"{len(instr.new_block_ids[group_idx])}")
+
+                # Determine which token positions to keep (using first layer).
+                first_layer = group.layer_names[0]
+                kv_cache = self.kv_caches_dict[first_layer]
+
+                ev_select_start.record()
+                kept_indices = policy.select_tokens_to_keep(
+                    kv_cache=kv_cache,
+                    block_ids=old_block_ids,
+                    seq_len=original_len,
+                    target_len=instr.compressed_len,
+                    block_size=block_size,
+                    keep_first=instr.keep_first,
+                    keep_last=instr.keep_last,
+                )
+                ev_select_end.record()
+
+                # Physically compact KV entries for all layers in this group.
+                ev_compact_start.record()
+                for layer_name in group.layer_names:
+                    kv_cache = self.kv_caches_dict[layer_name]
+                    compact_kv_cache(
+                        kv_cache, old_block_ids, kept_indices, block_size)
+                ev_compact_end.record()
+
+                # elapsed_time() requires the events to be completed;
+                # one synchronize here covers all four events above.
+                torch.cuda.synchronize()
+                t_select_ms += ev_select_start.elapsed_time(ev_select_end)
+                t_compact_ms += ev_compact_start.elapsed_time(ev_compact_end)
+
+            print(f"[KV Compression]   select_tokens_to_keep: "
+                  f"{t_select_ms:.2f} ms")
+            print(f"[KV Compression]   compact_kv_cache "
+                  f"({len(group.layer_names)} layers): "
+                  f"{t_compact_ms:.2f} ms")
+            print(f"[KV Compression] req {instr.req_id[:8]} done")
+            logger.debug(
+                "KV cache compression complete for req %s",
+                instr.req_id[:8],
+            )
+
+        t_total = time.perf_counter() - t_total_start
+        print(f"[KV Compression] total wall time: {t_total * 1000:.2f} ms")
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -3337,6 +3458,12 @@ class GPUModelRunner(
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
         ):
+            # Apply KV cache compressions BEFORE updating states so that the
+            # block table still holds the original pre-compression block IDs.
+            if scheduler_output.kv_compression_instructions:
+                self._apply_kv_compressions(
+                    scheduler_output.kv_compression_instructions)
+
             # Update persistent batch states.
             self._update_states(scheduler_output)
 
@@ -6014,6 +6141,8 @@ class GPUModelRunner(
             self.kv_caches,
             num_attn_module,
         )
+        # Store layer_name -> kv_cache tensor mapping for compression.
+        self.kv_caches_dict = kv_caches
         return kv_caches
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(
