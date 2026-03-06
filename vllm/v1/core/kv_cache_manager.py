@@ -299,9 +299,17 @@ class KVCacheManager:
             new_computed_block_list = self.empty_kv_cache_blocks.blocks
 
         # The number of computed tokens is the number of computed tokens plus
-        # the new prefix caching hits
+        # the new prefix caching hits.
+        # After KV cache compression, num_physical_kv_tokens reflects how many
+        # tokens the current KV blocks actually cover (compressed_len), which
+        # is less than num_computed_tokens (the logical position). Using the
+        # physical count here prevents allocate_slots() from treating the gap
+        # between compressed_len and num_computed_tokens as "needs new blocks"
+        # and immediately re-allocating all the blocks that were just freed.
+        physical_base = request.num_physical_kv_tokens
         num_local_computed_tokens = (
-            request.num_computed_tokens + num_new_computed_tokens
+            (physical_base if physical_base > 0 else request.num_computed_tokens)
+            + num_new_computed_tokens
         )
         total_computed_tokens = min(
             num_local_computed_tokens + num_external_computed_tokens,

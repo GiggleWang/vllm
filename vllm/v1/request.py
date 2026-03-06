@@ -138,6 +138,12 @@ class Request:
         # KV cache compression
         self.needs_kv_compression = False
         self.kv_compression_offset = 0
+        # Tracks the number of tokens physically covered by KV blocks after
+        # compression. Stays 0 when no compression has occurred. When > 0,
+        # kv_cache_manager uses this instead of num_computed_tokens as the
+        # baseline for block allocation so that freed blocks are not
+        # immediately re-allocated for the same request.
+        self.num_physical_kv_tokens: int = 0
 
         # Multi-modal related
         self.mm_features = mm_features or []
