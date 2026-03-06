@@ -946,6 +946,20 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+
+        # DEBUG: log decode batch size to verify compression effect on concurrency.
+        num_decode = sum(
+            1 for req_id, ntok in num_scheduled_tokens.items()
+            if ntok == 1  # decode step schedules exactly 1 new token
+        )
+        num_prefill = len(num_scheduled_tokens) - num_decode
+        print(
+            f"[SCHED] running={len(self.running)} "
+            f"scheduled={len(num_scheduled_tokens)} "
+            f"decode={num_decode} prefill={num_prefill} "
+            f"total_tokens={total_num_scheduled_tokens}"
+        )
+
         return scheduler_output
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
@@ -961,6 +975,7 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
+        request.num_physical_kv_tokens = 0
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1
@@ -1070,6 +1085,14 @@ class Scheduler(SchedulerInterface):
             new_block_ids_per_group.append(
                 [b.block_id for b in blocks_to_keep])
 
+        # Update the physical KV token count to the compressed length so that
+        # kv_cache_manager.allocate_slots() uses the correct baseline for
+        # block allocation. Without this, allocate_slots() would see that
+        # req_to_blocks has only ceil(compressed_len/block_size) blocks but
+        # num_computed_tokens is still original_len, and would immediately
+        # re-allocate all the freed blocks for the same request.
+        request.num_physical_kv_tokens = compressed_len
+
         logger.debug(
             "Req %s: freed %d KV blocks (deferred)",
             request.request_id[:8],
@@ -1101,6 +1124,12 @@ class Scheduler(SchedulerInterface):
             was_prefill = request.is_prefill_chunk
             old_num_computed = request.num_computed_tokens
             request.num_computed_tokens += num_scheduled_token
+            # Keep num_physical_kv_tokens in sync with the tokens actually
+            # scheduled each decode step. Once set (> 0), it must advance by
+            # the same amount as num_computed_tokens so that allocate_slots()
+            # always sees the correct physical baseline.
+            if request.num_physical_kv_tokens > 0:
+                request.num_physical_kv_tokens += num_scheduled_token
             new_is_prefill = request.num_computed_tokens < (
                 request.num_tokens + request.num_output_placeholders
             )

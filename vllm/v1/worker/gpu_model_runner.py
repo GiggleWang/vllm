@@ -3329,7 +3329,7 @@ class GPUModelRunner(
         print(f"[KV Compression] _apply_kv_compressions called with "
               f"{len(instructions)} instruction(s)")
 
-        t_total_start = time.perf_counter()
+        # t_total_start = time.perf_counter()
 
         for instr in instructions:
             req_index = self.input_batch.req_id_to_index.get(instr.req_id)
@@ -3356,15 +3356,15 @@ class GPUModelRunner(
 
             policy = get_compression_policy(instr.policy_type)
 
-            # Use CUDA Events for GPU timing: records timestamps directly on
-            # the GPU timeline without stalling the CPU-GPU pipeline.
-            ev_select_start = torch.cuda.Event(enable_timing=True)
-            ev_select_end = torch.cuda.Event(enable_timing=True)
-            ev_compact_start = torch.cuda.Event(enable_timing=True)
-            ev_compact_end = torch.cuda.Event(enable_timing=True)
+            # # Use CUDA Events for GPU timing: records timestamps directly on
+            # # the GPU timeline without stalling the CPU-GPU pipeline.
+            # ev_select_start = torch.cuda.Event(enable_timing=True)
+            # ev_select_end = torch.cuda.Event(enable_timing=True)
+            # ev_compact_start = torch.cuda.Event(enable_timing=True)
+            # ev_compact_end = torch.cuda.Event(enable_timing=True)
 
-            t_select_ms = 0.0
-            t_compact_ms = 0.0
+            # t_select_ms = 0.0
+            # t_compact_ms = 0.0
 
             for group_idx, group in enumerate(kv_cache_groups):
                 block_table = self.input_batch.block_table[group_idx]
@@ -3380,16 +3380,16 @@ class GPUModelRunner(
                     block_table.block_table.np[
                         req_index, :num_old_blocks].tolist())
 
-                print(f"[KV Compression]   group={group_idx} "
-                      f"block_size={block_size} "
-                      f"num_blocks: {num_old_blocks} -> "
-                      f"{len(instr.new_block_ids[group_idx])}")
+                # print(f"[KV Compression]   group={group_idx} "
+                #       f"block_size={block_size} "
+                #       f"num_blocks: {num_old_blocks} -> "
+                #       f"{len(instr.new_block_ids[group_idx])}")
 
                 # Determine which token positions to keep (using first layer).
                 first_layer = group.layer_names[0]
                 kv_cache = self.kv_caches_dict[first_layer]
 
-                ev_select_start.record()
+                # ev_select_start.record()
                 kept_indices = policy.select_tokens_to_keep(
                     kv_cache=kv_cache,
                     block_ids=old_block_ids,
@@ -3399,35 +3399,33 @@ class GPUModelRunner(
                     keep_first=instr.keep_first,
                     keep_last=instr.keep_last,
                 )
-                ev_select_end.record()
+                # ev_select_end.record()
 
                 # Physically compact KV entries for all layers in this group.
-                ev_compact_start.record()
+                # ev_compact_start.record()
                 for layer_name in group.layer_names:
                     kv_cache = self.kv_caches_dict[layer_name]
                     compact_kv_cache(
                         kv_cache, old_block_ids, kept_indices, block_size)
-                ev_compact_end.record()
+                # ev_compact_end.record()
 
                 # elapsed_time() requires the events to be completed;
                 # one synchronize here covers all four events above.
-                torch.cuda.synchronize()
-                t_select_ms += ev_select_start.elapsed_time(ev_select_end)
-                t_compact_ms += ev_compact_start.elapsed_time(ev_compact_end)
+                # torch.cuda.synchronize()
+                # t_select_ms += ev_select_start.elapsed_time(ev_select_end)
+                # t_compact_ms += ev_compact_start.elapsed_time(ev_compact_end)
 
-            print(f"[KV Compression]   select_tokens_to_keep: "
-                  f"{t_select_ms:.2f} ms")
-            print(f"[KV Compression]   compact_kv_cache "
-                  f"({len(group.layer_names)} layers): "
-                  f"{t_compact_ms:.2f} ms")
-            print(f"[KV Compression] req {instr.req_id[:8]} done")
+            # print(f"[KV Compression]   select_tokens_to_keep: "
+            #       f"{t_select_ms:.2f} ms")
+            # print(f"[KV Compression]   compact_kv_cache "
+            #       f"({len(group.layer_names)} layers): "
+            #       f"{t_compact_ms:.2f} ms")
+            # print(f"[KV Compression] req {instr.req_id[:8]} done")
             logger.debug(
                 "KV cache compression complete for req %s",
                 instr.req_id[:8],
             )
 
-        t_total = time.perf_counter() - t_total_start
-        print(f"[KV Compression] total wall time: {t_total * 1000:.2f} ms")
 
     @torch.inference_mode()
     def execute_model(
