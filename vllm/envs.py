@@ -118,6 +118,12 @@ if TYPE_CHECKING:
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
+    VLLM_DECODE_TIMING: bool = False
+    VLLM_DECODE_TIMING_INTERVAL: int = 10
+    VLLM_DECODE_TIMING_CSV: str = ""
+    VLLM_DECODE_METADATA_CSV: str = ""
+    VLLM_LOG_STEP_TOKENS: bool = False
+    VLLM_LOG_STEP_TOKENS_CSV: str = ""
     VLLM_DISABLE_COMPILE_CACHE: bool = False
     Q_SCALE_CONSTANT: int = 200
     K_SCALE_CONSTANT: int = 200
@@ -1004,6 +1010,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_LOG_BATCHSIZE_INTERVAL": lambda: float(
         os.getenv("VLLM_LOG_BATCHSIZE_INTERVAL", "-1")
+    ),
+    "VLLM_DECODE_TIMING": lambda: bool(
+        int(os.getenv("VLLM_DECODE_TIMING", "0"))
+    ),
+    "VLLM_DECODE_TIMING_INTERVAL": lambda: int(
+        os.getenv("VLLM_DECODE_TIMING_INTERVAL", "100")
+    ),
+    "VLLM_DECODE_TIMING_CSV": lambda: os.getenv(
+        "VLLM_DECODE_TIMING_CSV", ""
+    ),
+    "VLLM_DECODE_METADATA_CSV": lambda: os.getenv(
+        "VLLM_DECODE_METADATA_CSV", ""
+    ),
+    "VLLM_LOG_STEP_TOKENS": lambda: bool(
+        int(os.getenv("VLLM_LOG_STEP_TOKENS", "0"))
+    ),
+    "VLLM_LOG_STEP_TOKENS_CSV": lambda: os.getenv(
+        "VLLM_LOG_STEP_TOKENS_CSV", ""
     ),
     "VLLM_DISABLE_COMPILE_CACHE": disable_compile_cache,
     # If set, vllm will run in development mode, which will enable

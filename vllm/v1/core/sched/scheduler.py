@@ -947,18 +947,37 @@ class Scheduler(SchedulerInterface):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
 
-        # DEBUG: log decode batch size to verify compression effect on concurrency.
-        num_decode = sum(
-            1 for req_id, ntok in num_scheduled_tokens.items()
-            if ntok == 1  # decode step schedules exactly 1 new token
-        )
-        num_prefill = len(num_scheduled_tokens) - num_decode
-        print(
-            f"[SCHED] running={len(self.running)} "
-            f"scheduled={len(num_scheduled_tokens)} "
-            f"decode={num_decode} prefill={num_prefill} "
-            f"total_tokens={total_num_scheduled_tokens}"
-        )
+        # Log per-step prefill/decode token breakdown for diagnosis.
+        if envs.VLLM_LOG_STEP_TOKENS:
+            _decode_reqs = 0
+            _prefill_reqs = 0
+            _decode_toks = 0
+            _prefill_toks = 0
+            for _ntok in num_scheduled_tokens.values():
+                if _ntok == 1:
+                    _decode_reqs += 1
+                    _decode_toks += 1
+                else:
+                    _prefill_reqs += 1
+                    _prefill_toks += _ntok
+            _n_compress = len(kv_compression_instructions)
+            _ts = time.monotonic()
+            _line = (f"{_ts:.4f},{_decode_reqs},{_prefill_reqs},"
+                     f"{_decode_toks},{_prefill_toks},"
+                     f"{total_num_scheduled_tokens},"
+                     f"{_n_compress},{len(self.running)}")
+            if envs.VLLM_LOG_STEP_TOKENS_CSV:
+                if not hasattr(self, '_step_tokens_file'):
+                    self._step_tokens_file = open(
+                        envs.VLLM_LOG_STEP_TOKENS_CSV, 'w')
+                    self._step_tokens_file.write(
+                        "timestamp,decode_reqs,prefill_reqs,decode_tokens,"
+                        "prefill_tokens,total_tokens,num_compressions,"
+                        "running_queue_len\n")
+                self._step_tokens_file.write(_line + "\n")
+                self._step_tokens_file.flush()
+            else:
+                print(f"[STEP] {_line}")
 
         return scheduler_output
 

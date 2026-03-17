@@ -370,6 +370,9 @@ class GPUModelRunner(
         )
         # This will be overridden in load_model()
         self.is_multimodal_pruning_enabled = False
+        # Decode timer (overridden in load_model with hooks attached)
+        from vllm.utils.decode_timer import DecodeTimer
+        self.decode_timer = DecodeTimer(enabled=False)
         self.max_model_len = model_config.max_model_len
 
         # Always set to false after the first forward pass
@@ -1090,6 +1093,14 @@ class GPUModelRunner(
 
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
+            # Keep physical KV count in sync for compressed requests.
+            phys = self.input_batch.num_physical_kv_tokens_cpu[req_index]
+            if phys > 0:
+                # Advance by the same delta as num_computed_tokens.
+                num_scheduled = (
+                    scheduler_output.num_scheduled_tokens.get(req_id, 0))
+                self.input_batch.num_physical_kv_tokens_cpu[
+                    req_index] = phys + num_scheduled
             if new_block_ids is not None:
                 self.input_batch.block_table.append_row(new_block_ids, req_index)
 
@@ -1566,7 +1577,19 @@ class GPUModelRunner(
 
                 output_idx += num_sched
 
-        self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
+        # For slot_mapping, compressed requests must use physical KV
+        # positions (not logical positions) so that new KV entries are
+        # written into the correct block/offset.
+        phys_kv = self.input_batch.num_physical_kv_tokens_cpu[:num_reqs]
+        if np.any(phys_kv > 0):
+            kv_write_positions = positions_np.copy()
+            np.add(phys_kv[req_indices], arange, out=kv_write_positions,
+                   where=(phys_kv[req_indices] > 0))
+            self.input_batch.block_table.compute_slot_mapping(
+                req_indices, kv_write_positions)
+        else:
+            self.input_batch.block_table.compute_slot_mapping(
+                req_indices, positions_np)
         self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
 
         # Prepare the attention metadata.
@@ -1578,9 +1601,16 @@ class GPUModelRunner(
         self.query_start_loc.copy_to_gpu()
         query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]
 
-        self.seq_lens.np[:num_reqs] = (
-            self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
+        # For seq_lens (passed to attention), use the physical KV token
+        # count when available (i.e. after KV-cache compression).  This
+        # ensures FlashAttention only reads the valid compressed blocks.
+        phys = self.input_batch.num_physical_kv_tokens_cpu[:num_reqs]
+        base = np.where(
+            phys > 0,
+            phys,
+            self.input_batch.num_computed_tokens_cpu[:num_reqs],
         )
+        self.seq_lens.np[:num_reqs] = base + num_scheduled_tokens
         # Fill unused with 0 for full cuda graph mode.
         self.seq_lens.np[num_reqs:].fill(0)
         self.seq_lens.copy_to_gpu()
@@ -1589,9 +1619,15 @@ class GPUModelRunner(
         num_tokens_np = np.array(num_tokens, dtype=np.int32)
 
         # Record which requests should not be sampled,
-        # so that we could clear the sampled tokens before returning
+        # so that we could clear the sampled tokens before returning.
+        # Use logical token count (not physical seq_lens which may be
+        # smaller after KV-cache compression) to decide prefill status.
+        logical_seq_lens = (
+            self.input_batch.num_computed_tokens_cpu[:num_reqs]
+            + num_scheduled_tokens
+        )
         self.discard_request_mask.np[:num_reqs] = (
-            self.seq_lens.np[:num_reqs] < num_tokens_np
+            logical_seq_lens < num_tokens_np
         )
         self.discard_request_mask.copy_to_gpu(num_reqs)
 
@@ -3326,26 +3362,14 @@ class GPUModelRunner(
            _update_states(), which re-adds the request with the new block IDs.
         """
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
-        print(f"[KV Compression] _apply_kv_compressions called with "
-              f"{len(instructions)} instruction(s)")
-
-        # t_total_start = time.perf_counter()
-
         for instr in instructions:
             req_index = self.input_batch.req_id_to_index.get(instr.req_id)
             if req_index is None:
-                print(f"[KV Compression] req {instr.req_id[:8]} not found in "
-                      f"batch, skipping")
                 continue
 
             # Number of tokens in KV cache before compression.
             original_len = int(
                 self.input_batch.num_computed_tokens_cpu[req_index])
-
-            print(f"[KV Compression] req={instr.req_id[:8]} "
-                  f"policy={instr.policy_type} "
-                  f"{original_len} -> {instr.compressed_len} tokens "
-                  f"(keep_first={instr.keep_first}, keep_last={instr.keep_last})")
 
             logger.debug(
                 "Compressing KV cache for req %s: %d -> %d tokens",
@@ -3465,6 +3489,18 @@ class GPUModelRunner(
             # Update persistent batch states.
             self._update_states(scheduler_output)
 
+            # After _update_states re-adds compressed requests to the batch,
+            # set their physical KV token count so that _prepare_inputs
+            # computes seq_lens from the compressed length, not the logical
+            # num_computed_tokens.
+            if scheduler_output.kv_compression_instructions:
+                for instr in scheduler_output.kv_compression_instructions:
+                    req_index = self.input_batch.req_id_to_index.get(
+                        instr.req_id)
+                    if req_index is not None:
+                        self.input_batch.num_physical_kv_tokens_cpu[
+                            req_index] = instr.compressed_len
+
             if has_ec_transfer() and get_ec_transfer().is_producer:
                 with self.maybe_get_ec_connector_output(
                     scheduler_output,
@@ -3504,6 +3540,29 @@ class GPUModelRunner(
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+
+            # Record per-request batch metadata for decode analysis.
+            if self.decode_timer.enabled and self.decode_timer.metadata_csv_path:
+                num_computed = self.input_batch.num_computed_tokens_cpu
+                num_physical = self.input_batch.num_physical_kv_tokens_cpu
+                num_prompt = self.input_batch.num_prompt_tokens
+                batch_metadata = []
+                for i in range(num_reqs):
+                    n_tokens = int(num_scheduled_tokens_np[i])
+                    # Use physical KV length if compression is active,
+                    # otherwise fall back to logical num_computed_tokens.
+                    phys = int(num_physical[i])
+                    logical = int(num_computed[i])
+                    effective_seq_len = phys if phys > 0 else logical
+                    batch_metadata.append({
+                        "req_id": req_ids[i],
+                        "is_decode": n_tokens == 1,
+                        "num_scheduled_tokens": n_tokens,
+                        "seq_len": effective_seq_len,
+                        "logical_seq_len": logical,
+                        "num_prompt_tokens": int(num_prompt[i]),
+                    })
+                self.decode_timer.record_batch_metadata(batch_metadata)
 
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
@@ -3740,6 +3799,9 @@ class GPUModelRunner(
             slot_mappings,
         )
         self.kv_connector_output = kv_connector_output
+
+        # Collect per-module timing data for this iteration.
+        self.decode_timer.on_iteration_end()
         return None
 
     @torch.inference_mode
@@ -4360,6 +4422,16 @@ class GPUModelRunner(
             and mm_config is not None
             and mm_config.is_multimodal_pruning_enabled()
         )
+
+        # Initialize decode timing if enabled.
+        from vllm.utils.decode_timer import DecodeTimer
+        self.decode_timer = DecodeTimer(
+            enabled=envs.VLLM_DECODE_TIMING,
+            log_interval=envs.VLLM_DECODE_TIMING_INTERVAL,
+            csv_path=envs.VLLM_DECODE_TIMING_CSV or None,
+            metadata_csv_path=envs.VLLM_DECODE_METADATA_CSV or None,
+        )
+        self.decode_timer.attach_hooks(self.model)
 
         if is_mixture_of_experts(self.model) and self.parallel_config.enable_eplb:
             logger.info_once("EPLB is enabled for model %s.", self.model_config.model)
