@@ -124,6 +124,10 @@ if TYPE_CHECKING:
     VLLM_DECODE_METADATA_CSV: str = ""
     VLLM_LOG_STEP_TOKENS: bool = False
     VLLM_LOG_STEP_TOKENS_CSV: str = ""
+    # When the number of decode requests in running queue exceeds this
+    # threshold, skip scheduling new prefill requests to protect decode
+    # latency. 0 = disabled (default).
+    VLLM_PREFILL_DECAY_THRESHOLD: int = 0
     VLLM_DISABLE_COMPILE_CACHE: bool = False
     Q_SCALE_CONSTANT: int = 200
     K_SCALE_CONSTANT: int = 200
@@ -1028,6 +1032,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_LOG_STEP_TOKENS_CSV": lambda: os.getenv(
         "VLLM_LOG_STEP_TOKENS_CSV", ""
+    ),
+    "VLLM_PREFILL_DECAY_THRESHOLD": lambda: int(
+        os.getenv("VLLM_PREFILL_DECAY_THRESHOLD", "0")
     ),
     "VLLM_DISABLE_COMPILE_CACHE": disable_compile_cache,
     # If set, vllm will run in development mode, which will enable
