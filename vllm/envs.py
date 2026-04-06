@@ -128,6 +128,9 @@ if TYPE_CHECKING:
     # threshold, skip scheduling new prefill requests to protect decode
     # latency. 0 = disabled (default).
     VLLM_PREFILL_DECAY_THRESHOLD: int = 0
+    # Adaptive prefill throttling: limit prefill token budget
+    # proportionally to the decode request ratio. 0 = disabled (default).
+    VLLM_ADAPTIVE_PREFILL: bool = False
     VLLM_DISABLE_COMPILE_CACHE: bool = False
     Q_SCALE_CONSTANT: int = 200
     K_SCALE_CONSTANT: int = 200
@@ -1035,6 +1038,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_PREFILL_DECAY_THRESHOLD": lambda: int(
         os.getenv("VLLM_PREFILL_DECAY_THRESHOLD", "0")
+    ),
+    "VLLM_ADAPTIVE_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_ADAPTIVE_PREFILL", "0"))
     ),
     "VLLM_DISABLE_COMPILE_CACHE": disable_compile_cache,
     # If set, vllm will run in development mode, which will enable

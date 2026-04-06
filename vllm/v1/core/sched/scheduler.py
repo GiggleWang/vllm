@@ -569,8 +569,7 @@ class Scheduler(SchedulerInterface):
         # skipped and put back at the head of the waiting queue later
         skipped_waiting_requests = create_request_queue(self.policy)
 
-        # Prefill decay: when decode requests exceed the threshold, skip
-        # scheduling new prefill requests to protect decode TPOT.
+        # --- Mode 1: Legacy threshold-based skip (baseline when =0) ---
         prefill_decay_threshold = envs.VLLM_PREFILL_DECAY_THRESHOLD
         skip_prefill_for_decode = False
         if prefill_decay_threshold > 0:
@@ -581,9 +580,24 @@ class Scheduler(SchedulerInterface):
             if num_decode_running >= prefill_decay_threshold:
                 skip_prefill_for_decode = True
 
+        # --- Mode 2: Adaptive decode-proportional throttling ---
+        # Limit prefill budget proportionally to decode pressure.
+        # Uses len(self.running) as denominator (actual concurrent requests),
+        # not max_num_running_reqs (theoretical capacity), to avoid diluting
+        # the ratio when the system is not fully loaded.
+        budget_floor = 0
+        if envs.VLLM_ADAPTIVE_PREFILL and len(self.running) > 0:
+            num_decode_running = sum(
+                1 for r in self.running
+                if r.num_computed_tokens >= r.num_prompt_tokens
+            )
+            if num_decode_running > 0:
+                decode_ratio = num_decode_running / len(self.running)
+                budget_floor = int(token_budget * decode_ratio)
+
         # Next, schedule the WAITING requests.
         if not preempted_reqs and not skip_prefill_for_decode:
-            while self.waiting and token_budget > 0:
+            while self.waiting and token_budget > budget_floor:
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
@@ -975,10 +989,22 @@ class Scheduler(SchedulerInterface):
             _n_compress = len(kv_compression_instructions)
             _ts = time.monotonic()
             _skip = 1 if skip_prefill_for_decode else 0
+            # Actual decode ratio: decode_running / total_running
+            _num_running = len(self.running)
+            _num_decode_in_running = sum(
+                1 for r in self.running
+                if r.num_computed_tokens >= r.num_prompt_tokens
+            )
+            _decode_ratio = (
+                _num_decode_in_running / _num_running
+                if _num_running > 0 else 0.0
+            )
+            _prefill_budget = token_budget - budget_floor
             _line = (f"{_ts:.4f},{_decode_reqs},{_prefill_reqs},"
                      f"{_decode_toks},{_prefill_toks},"
                      f"{total_num_scheduled_tokens},"
-                     f"{_n_compress},{len(self.running)},{_skip}")
+                     f"{_n_compress},{_num_running},{_skip},"
+                     f"{_decode_ratio:.3f},{budget_floor},{_prefill_budget}")
             if envs.VLLM_LOG_STEP_TOKENS_CSV:
                 if not hasattr(self, '_step_tokens_file'):
                     self._step_tokens_file = open(
@@ -986,7 +1012,8 @@ class Scheduler(SchedulerInterface):
                     self._step_tokens_file.write(
                         "timestamp,decode_reqs,prefill_reqs,decode_tokens,"
                         "prefill_tokens,total_tokens,num_compressions,"
-                        "running_queue_len,prefill_skipped\n")
+                        "running_queue_len,prefill_skipped,"
+                        "decode_ratio,budget_floor,prefill_budget\n")
                 self._step_tokens_file.write(_line + "\n")
                 self._step_tokens_file.flush()
             else:
