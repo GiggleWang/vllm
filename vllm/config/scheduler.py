@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
-SchedulerPolicy = Literal["fcfs", "priority"]
+SchedulerPolicy = Literal["fcfs", "priority", "sola"]
 
 
 @config
@@ -103,7 +103,25 @@ class SchedulerConfig:
     - "fcfs" means first come first served, i.e. requests are handled in order
     of arrival.\n
     - "priority" means requests are handled based on given priority (lower
-    value means earlier handling) and time of arrival deciding any ties)."""
+    value means earlier handling) and time of arrival deciding any ties).\n
+    - "sola" means SOLA state-aware scheduling (MLSys 2025), which
+    dynamically decides prefill/decode priority based on TTFT/TPOT SLO
+    attainment."""
+
+    slo_ttft: float = 5.0
+    """TTFT SLO target in seconds (only used with policy='sola')."""
+
+    slo_tpot: float = 0.1
+    """TPOT SLO target in seconds (only used with policy='sola')."""
+
+    sola_cost_alpha: float = 0.1
+    """EMA weight for SOLA cost model scaling ratio."""
+
+    sola_percentile: float = 0.95
+    """Percentile for SOLA constraint loosening when SLOs are violated."""
+
+    sola_window_size: int = 10
+    """Sliding window size for SOLA phase decision smoothing."""
 
     disable_chunked_mm_input: bool = False
     """If set to true and chunked prefill is enabled, we do not want to

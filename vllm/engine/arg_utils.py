@@ -534,6 +534,11 @@ class EngineArgs:
     enable_mm_processor_stats: bool = ObservabilityConfig.enable_mm_processor_stats
     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
     scheduler_cls: str | type[object] | None = SchedulerConfig.scheduler_cls
+    slo_ttft: float = SchedulerConfig.slo_ttft
+    slo_tpot: float = SchedulerConfig.slo_tpot
+    sola_cost_alpha: float = SchedulerConfig.sola_cost_alpha
+    sola_percentile: float = SchedulerConfig.sola_percentile
+    sola_window_size: int = SchedulerConfig.sola_window_size
 
     pooler_config: PoolerConfig | None = ModelConfig.pooler_config
     compilation_config: CompilationConfig = get_field(VllmConfig, "compilation_config")
@@ -1159,6 +1164,26 @@ class EngineArgs:
             "--scheduling-policy", **scheduler_kwargs["policy"]
         )
         scheduler_group.add_argument(
+            "--slo-ttft",
+            **scheduler_kwargs["slo_ttft"],
+        )
+        scheduler_group.add_argument(
+            "--slo-tpot",
+            **scheduler_kwargs["slo_tpot"],
+        )
+        scheduler_group.add_argument(
+            "--sola-cost-alpha",
+            **scheduler_kwargs["sola_cost_alpha"],
+        )
+        scheduler_group.add_argument(
+            "--sola-percentile",
+            **scheduler_kwargs["sola_percentile"],
+        )
+        scheduler_group.add_argument(
+            "--sola-window-size",
+            **scheduler_kwargs["sola_window_size"],
+        )
+        scheduler_group.add_argument(
             "--enable-chunked-prefill",
             **{
                 **scheduler_kwargs["enable_chunked_prefill"],
@@ -1708,6 +1733,11 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
+            slo_ttft=self.slo_ttft,
+            slo_tpot=self.slo_tpot,
+            sola_cost_alpha=self.sola_cost_alpha,
+            sola_percentile=self.sola_percentile,
+            sola_window_size=self.sola_window_size,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:

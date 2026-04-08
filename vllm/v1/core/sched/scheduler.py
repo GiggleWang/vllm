@@ -268,6 +268,32 @@ class Scheduler(SchedulerInterface):
         # and pipeline parallelism where the scheduler runs ahead of the worker.
         self._deferred_free_blocks: dict[str, list[KVCacheBlock]] = {}
 
+        # SOLA state-aware scheduling (MLSys 2025)
+        self.sola: "StrategyGenerator | None" = None
+        self._sola_last_schedule_time: float = 0.0
+        if self.scheduler_config.policy == "sola":
+            from vllm.v1.core.sched.sola import (
+                CostModel,
+                StateMonitor,
+                StrategyGenerator,
+            )
+
+            self.sola = StrategyGenerator(
+                slo_ttft=self.scheduler_config.slo_ttft,
+                slo_tpot=self.scheduler_config.slo_tpot,
+                cost_model=CostModel(
+                    alpha=self.scheduler_config.sola_cost_alpha
+                ),
+                state_monitor=StateMonitor(),
+                percentile=self.scheduler_config.sola_percentile,
+                window_size=self.scheduler_config.sola_window_size,
+            )
+            logger.info(
+                "SOLA scheduling enabled: slo_ttft=%.1fs, slo_tpot=%.3fs",
+                self.scheduler_config.slo_ttft,
+                self.scheduler_config.slo_tpot,
+            )
+
         def has_mamba_layers(kv_cache_config: KVCacheConfig) -> bool:
             return any(
                 isinstance(group_spec.kv_cache_spec, MambaSpec)
@@ -386,6 +412,28 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
+
+        # SOLA: calibrate cost model and get scheduling decision
+        sola_decision = None
+        if self.sola is not None:
+            from vllm.v1.core.sched.sola import SOLADecision
+
+            now = time.monotonic()
+            # Calibrate cost model with time since last schedule (Eq 5)
+            if self._sola_last_schedule_time > 0:
+                actual_time = now - self._sola_last_schedule_time
+                self.sola.cost_model.update_scaling(
+                    actual_time, self.sola._last_predicted_cost
+                )
+            self._sola_last_schedule_time = now
+            # Get SOLA decision
+            waiting_snapshot = list(self.waiting)
+            sola_decision = self.sola.decide(waiting_snapshot, self.running)
+            # Reorder waiting queue based on SOLA's sorted list
+            if sola_decision.sorted_waiting is not None:
+                self.waiting.clear()
+                for req in sola_decision.sorted_waiting:
+                    self.waiting.add_request(req)
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -570,10 +618,29 @@ class Scheduler(SchedulerInterface):
         skipped_waiting_requests = create_request_queue(self.policy)
 
         # Next, schedule the WAITING requests.
+        # SOLA admission counters
+        sola_new_prefill_count = 0
+        sola_prefill_token_budget = float("inf")
+        if sola_decision is not None:
+            if sola_decision.max_new_tokens is not None:
+                sola_prefill_token_budget = sola_decision.max_new_tokens
+
         if not preempted_reqs:
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
+
+                # SOLA admission limits
+                if sola_decision is not None:
+                    if (
+                        sola_decision.phase_priority == "decode_first"
+                        and sola_decision.max_prefill_reqs is not None
+                        and sola_new_prefill_count
+                        >= sola_decision.max_prefill_reqs
+                    ):
+                        break
+                    if sola_prefill_token_budget <= 0:
+                        break
 
                 request = self.waiting.peek_request()
                 request_id = request.request_id
@@ -819,6 +886,10 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
+                # SOLA: track admitted prefill requests and token budget
+                if sola_decision is not None:
+                    sola_new_prefill_count += 1
+                    sola_prefill_token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 # Count the number of prefix cached tokens.
@@ -840,6 +911,32 @@ class Scheduler(SchedulerInterface):
         # Put back any skipped requests at the head of the waiting queue
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
+
+        # SOLA: compute predicted cost from actual batch for EMA calibration
+        if self.sola is not None and num_scheduled_tokens:
+            cm = self.sola.cost_model
+            prefill_lens: list[int] = []
+            cached_lens: list[int] = []
+            decode_count = 0
+            decode_total_seq = 0
+            for req_id, ntok in num_scheduled_tokens.items():
+                req = self.requests[req_id]
+                if req.is_prefill_chunk or ntok > 1:
+                    cached_lens.append(req.num_computed_tokens)
+                    prefill_lens.append(ntok)
+                else:
+                    decode_count += 1
+                    decode_total_seq += req.num_computed_tokens
+            if prefill_lens:
+                self.sola._last_predicted_cost = (
+                    cm.estimate_prefill_cost_from_lens(
+                        cached_lens, prefill_lens
+                    )
+                )
+            elif decode_count > 0:
+                self.sola._last_predicted_cost = cm.estimate_decode_cost(
+                    decode_count, decode_total_seq
+                )
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
@@ -953,12 +1050,12 @@ class Scheduler(SchedulerInterface):
             if ntok == 1  # decode step schedules exactly 1 new token
         )
         num_prefill = len(num_scheduled_tokens) - num_decode
-        print(
-            f"[SCHED] running={len(self.running)} "
-            f"scheduled={len(num_scheduled_tokens)} "
-            f"decode={num_decode} prefill={num_prefill} "
-            f"total_tokens={total_num_scheduled_tokens}"
-        )
+        # print(
+        #     f"[SCHED] running={len(self.running)} "
+        #     f"scheduled={len(num_scheduled_tokens)} "
+        #     f"decode={num_decode} prefill={num_prefill} "
+        #     f"total_tokens={total_num_scheduled_tokens}"
+        # )
 
         return scheduler_output
 
@@ -1149,6 +1246,19 @@ class Scheduler(SchedulerInterface):
             if (is_completing_prefill
                     and self.kv_compression_config is not None):
                 request.needs_kv_compression = True
+
+            # SOLA lifecycle hooks
+            if self.sola is not None:
+                now_sola = time.monotonic()
+                if is_completing_prefill:
+                    self.sola.state_monitor.on_prefill_complete(
+                        req_id, now_sola
+                    )
+                elif not was_prefill and not new_is_prefill:
+                    # Pure decode step
+                    self.sola.state_monitor.on_decode_step(
+                        req_id, now_sola
+                    )
 
             # NOTE: _free_encoder_inputs relies on num_computed_tokens, which
             # may be updated again in _update_from_output for speculative
@@ -1605,6 +1715,9 @@ class Scheduler(SchedulerInterface):
                 finished = self._handle_stopped_request(request)
                 if finished:
                     kv_transfer_params = self._free_request(request)
+                # SOLA: record request finish
+                if self.sola is not None:
+                    self.sola.state_monitor.on_request_finish(req_id)
 
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
@@ -1912,6 +2025,14 @@ class Scheduler(SchedulerInterface):
             self.requests[request.request_id] = request
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
+            # SOLA: register request for timing tracking
+            if self.sola is not None:
+                self.sola.state_monitor.register_request(
+                    request_id=request.request_id,
+                    arrival_time=request.arrival_time,
+                    input_len=request.num_prompt_tokens,
+                    predicted_output_len=request.max_tokens,
+                )
 
     def finish_requests(
         self, request_ids: str | Iterable[str], finished_status: RequestStatus
@@ -1954,6 +2075,11 @@ class Scheduler(SchedulerInterface):
 
         # Second pass: set status and free requests
         for request in valid_requests:
+            # SOLA: record request finish for aborted requests
+            if self.sola is not None:
+                self.sola.state_monitor.on_request_finish(
+                    request.request_id
+                )
             delay_free_blocks = False
             if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 delay_free_blocks = (

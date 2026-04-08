@@ -15,6 +15,7 @@ class SchedulingPolicy(Enum):
 
     FCFS = "fcfs"
     PRIORITY = "priority"
+    SOLA = "sola"
 
 
 class RequestQueue(ABC):
@@ -203,6 +204,9 @@ def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
     if policy == SchedulingPolicy.PRIORITY:
         return PriorityRequestQueue()
     elif policy == SchedulingPolicy.FCFS:
+        return FCFSRequestQueue()
+    elif policy == SchedulingPolicy.SOLA:
+        # SOLA handles reordering itself; use FCFS as the base queue
         return FCFSRequestQueue()
     else:
         raise ValueError(f"Unknown scheduling policy: {policy}")
