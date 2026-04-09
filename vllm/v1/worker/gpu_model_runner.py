@@ -1090,6 +1090,14 @@ class GPUModelRunner(
 
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
+            # Keep physical KV count in sync for compressed requests.
+            phys = self.input_batch.num_physical_kv_tokens_cpu[req_index]
+            if phys > 0:
+                # Advance by the same delta as num_computed_tokens.
+                num_scheduled = (
+                    scheduler_output.num_scheduled_tokens.get(req_id, 0))
+                self.input_batch.num_physical_kv_tokens_cpu[
+                    req_index] = phys + num_scheduled
             if new_block_ids is not None:
                 self.input_batch.block_table.append_row(new_block_ids, req_index)
 
@@ -1566,7 +1574,19 @@ class GPUModelRunner(
 
                 output_idx += num_sched
 
-        self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
+        # For slot_mapping, compressed requests must use physical KV
+        # positions (not logical positions) so that new KV entries are
+        # written into the correct block/offset.
+        phys_kv = self.input_batch.num_physical_kv_tokens_cpu[:num_reqs]
+        if np.any(phys_kv > 0):
+            kv_write_positions = positions_np.copy()
+            np.add(phys_kv[req_indices], arange, out=kv_write_positions,
+                   where=(phys_kv[req_indices] > 0))
+            self.input_batch.block_table.compute_slot_mapping(
+                req_indices, kv_write_positions)
+        else:
+            self.input_batch.block_table.compute_slot_mapping(
+                req_indices, positions_np)
         self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
 
         # Prepare the attention metadata.
@@ -1578,9 +1598,16 @@ class GPUModelRunner(
         self.query_start_loc.copy_to_gpu()
         query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]
 
-        self.seq_lens.np[:num_reqs] = (
-            self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
+        # For seq_lens (passed to attention), use the physical KV token
+        # count when available (i.e. after KV-cache compression).  This
+        # ensures FlashAttention only reads the valid compressed blocks.
+        phys = self.input_batch.num_physical_kv_tokens_cpu[:num_reqs]
+        base = np.where(
+            phys > 0,
+            phys,
+            self.input_batch.num_computed_tokens_cpu[:num_reqs],
         )
+        self.seq_lens.np[:num_reqs] = base + num_scheduled_tokens
         # Fill unused with 0 for full cuda graph mode.
         self.seq_lens.np[num_reqs:].fill(0)
         self.seq_lens.copy_to_gpu()
@@ -1589,9 +1616,15 @@ class GPUModelRunner(
         num_tokens_np = np.array(num_tokens, dtype=np.int32)
 
         # Record which requests should not be sampled,
-        # so that we could clear the sampled tokens before returning
+        # so that we could clear the sampled tokens before returning.
+        # Use logical token count (not physical seq_lens which may be
+        # smaller after KV-cache compression) to decide prefill status.
+        logical_seq_lens = (
+            self.input_batch.num_computed_tokens_cpu[:num_reqs]
+            + num_scheduled_tokens
+        )
         self.discard_request_mask.np[:num_reqs] = (
-            self.seq_lens.np[:num_reqs] < num_tokens_np
+            logical_seq_lens < num_tokens_np
         )
         self.discard_request_mask.copy_to_gpu(num_reqs)
 
@@ -3464,6 +3497,18 @@ class GPUModelRunner(
 
             # Update persistent batch states.
             self._update_states(scheduler_output)
+
+            # After _update_states re-adds compressed requests to the batch,
+            # set their physical KV token count so that _prepare_inputs
+            # computes seq_lens from the compressed length, not the logical
+            # num_computed_tokens.
+            if scheduler_output.kv_compression_instructions:
+                for instr in scheduler_output.kv_compression_instructions:
+                    req_index = self.input_batch.req_id_to_index.get(
+                        instr.req_id)
+                    if req_index is not None:
+                        self.input_batch.num_physical_kv_tokens_cpu[
+                            req_index] = instr.compressed_len
 
             if has_ec_transfer() and get_ec_transfer().is_producer:
                 with self.maybe_get_ec_connector_output(

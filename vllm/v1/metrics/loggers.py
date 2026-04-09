@@ -221,12 +221,14 @@ class LoggingStatLogger(StatLoggerBase):
             "Avg generation throughput: %.1f tokens/s",
             "Running: %d reqs",
             "Waiting: %d reqs",
+            "Batched tokens: %d",
         ]
         log_args: list[int | float | str] = [
             self.last_prompt_throughput,
             self.last_generation_throughput,
             self.last_scheduler_stats.num_running_reqs,
             self.last_scheduler_stats.num_waiting_reqs,
+            self.last_scheduler_stats.num_batched_tokens,
         ]
 
         if self.num_preemptions > 0:
