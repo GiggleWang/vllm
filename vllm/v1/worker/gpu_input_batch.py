@@ -137,6 +137,14 @@ class InputBatch:
         )
         self.num_computed_tokens_cpu = self.num_computed_tokens_cpu_tensor.numpy()
 
+        # Physical KV token count per request.  Normally equals
+        # num_computed_tokens, but after KV-cache compression it reflects
+        # the *compressed* length so that seq_lens passed to attention
+        # matches the actual number of valid KV entries.
+        # A value of 0 means "not compressed, use num_computed_tokens".
+        self.num_physical_kv_tokens_cpu = np.zeros(max_num_reqs,
+                                                   dtype=np.int32)
+
         # Block table.
         self.block_table = MultiGroupBlockTable(
             max_num_reqs=max_num_reqs,
@@ -339,6 +347,8 @@ class InputBatch:
         self.num_tokens_no_spec[req_index] = request.num_tokens
 
         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
+        # Reset physical KV count; will be set by compression if needed.
+        self.num_physical_kv_tokens_cpu[req_index] = 0
         self.block_table.add_row(request.block_ids, req_index)
 
         if sampling_params := request.sampling_params:
@@ -549,6 +559,11 @@ class InputBatch:
             self.num_computed_tokens_cpu[i2],
             self.num_computed_tokens_cpu[i1],
         )
+        self.num_physical_kv_tokens_cpu[i1], \
+            self.num_physical_kv_tokens_cpu[i2] = (
+            self.num_physical_kv_tokens_cpu[i2],
+            self.num_physical_kv_tokens_cpu[i1],
+        )
 
         # NOTE: the following is unsafe
         # self.token_ids_cpu[i1, ...], self.token_ids_cpu[i2, ...], =\
@@ -699,6 +714,8 @@ class InputBatch:
             self.num_computed_tokens_cpu[empty_index] = self.num_computed_tokens_cpu[
                 last_req_index
             ]
+            self.num_physical_kv_tokens_cpu[empty_index] = \
+                self.num_physical_kv_tokens_cpu[last_req_index]
             self.block_table.move_row(last_req_index, empty_index)
 
             self.request_lora_mapping[empty_index] = self.request_lora_mapping[
