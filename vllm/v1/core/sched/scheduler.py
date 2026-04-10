@@ -268,6 +268,30 @@ class Scheduler(SchedulerInterface):
         # and pipeline parallelism where the scheduler runs ahead of the worker.
         self._deferred_free_blocks: dict[str, list[KVCacheBlock]] = {}
 
+        # Compression-Aware Adaptive Scheduler (CAAS) — M1
+        self.caas: "AdmissionController | None" = None
+        self._caas_last_schedule_time: float = 0.0
+        # Features from the previous step used to update the cost model
+        self._caas_last_features: tuple[int, int, int] | None = None
+        if (self.kv_compression_config is not None
+                and self.scheduler_config.slo_ttft > 0
+                and self.scheduler_config.slo_tpot > 0):
+            from vllm.v1.core.sched.caas import AdmissionController
+            self.caas = AdmissionController(
+                ttft_slo=self.scheduler_config.slo_ttft,
+                tpot_slo=self.scheduler_config.slo_tpot,
+                base_max_running=self.max_num_running_reqs,
+                base_token_budget=self.max_num_scheduled_tokens,
+                cooldown_steps=self.scheduler_config.caas_cooldown_steps,
+                warmup_steps=self.scheduler_config.caas_warmup_steps,
+                forgetting_factor=self.scheduler_config.caas_forgetting_factor,
+            )
+            logger.info(
+                "CAAS enabled: ttft_slo=%.1fs tpot_slo=%.3fs",
+                self.scheduler_config.slo_ttft,
+                self.scheduler_config.slo_tpot,
+            )
+
         def has_mamba_layers(kv_cache_config: KVCacheConfig) -> bool:
             return any(
                 isinstance(group_spec.kv_cache_spec, MambaSpec)
@@ -386,6 +410,20 @@ class Scheduler(SchedulerInterface):
         scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
+
+        # CAAS — M2: update cost model with previous step's actual time,
+        # then compute admission constraints for this step.
+        caas_constraints = None
+        if self.caas is not None:
+            now_caas = time.monotonic()
+            if (self._caas_last_schedule_time > 0
+                    and self._caas_last_features is not None):
+                actual_step_time = now_caas - self._caas_last_schedule_time
+                self.caas.cost_model.update(
+                    *self._caas_last_features, actual_step_time)
+            self._caas_last_schedule_time = now_caas
+            caas_constraints = self.caas.get_constraints(
+                self.running, list(self.waiting))
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -570,9 +608,23 @@ class Scheduler(SchedulerInterface):
         skipped_waiting_requests = create_request_queue(self.policy)
 
         # Next, schedule the WAITING requests.
+        # CAAS — M3: set up dynamic limits from constraints
+        caas_prefill_budget = float("inf")
+        if caas_constraints is not None:
+            caas_prefill_budget = float(caas_constraints.max_prefill_tokens)
+
         if not preempted_reqs:
             while self.waiting and token_budget > 0:
-                if len(self.running) == self.max_num_running_reqs:
+                # CAAS: dynamic decode batch cap (replaces static check below)
+                effective_max_running = self.max_num_running_reqs
+                if caas_constraints is not None:
+                    effective_max_running = min(
+                        effective_max_running,
+                        caas_constraints.max_decode_batch,
+                    )
+                    if not caas_constraints.admit_new:
+                        break
+                if len(self.running) >= effective_max_running:
                     break
 
                 request = self.waiting.peek_request()
@@ -705,6 +757,13 @@ class Scheduler(SchedulerInterface):
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
+                    # CAAS — M4: enforce prefill token budget
+                    # num_new_tokens > 1 distinguishes prefill from decode
+                    if caas_constraints is not None and num_new_tokens > 1:
+                        num_new_tokens = min(
+                            num_new_tokens, int(caas_prefill_budget))
+                        if num_new_tokens <= 0:
+                            break
                     assert num_new_tokens > 0
 
                     # Schedule encoder inputs.
@@ -819,6 +878,9 @@ class Scheduler(SchedulerInterface):
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
+                # CAAS — M5: consume prefill budget
+                if caas_constraints is not None and num_new_tokens > 1:
+                    caas_prefill_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 # Count the number of prefix cached tokens.
@@ -848,6 +910,18 @@ class Scheduler(SchedulerInterface):
 
         assert token_budget >= 0
         assert len(self.running) <= self.max_num_running_reqs
+
+        # CAAS — M6: record step features for next-step cost model update
+        if self.caas is not None and num_scheduled_tokens:
+            n_dec = sum(
+                1 for v in num_scheduled_tokens.values() if v == 1)
+            p_tok = sum(
+                v for v in num_scheduled_tokens.values() if v > 1)
+            t_kv = sum(
+                self.requests[rid].num_computed_tokens
+                for rid in num_scheduled_tokens
+            )
+            self._caas_last_features = (n_dec, p_tok, t_kv)
         # Since some requests in the RUNNING queue may not be scheduled in
         # this step, the total number of scheduled requests can be smaller than
         # len(self.running).
@@ -1033,6 +1107,9 @@ class Scheduler(SchedulerInterface):
                 compressed_len,
                 100.0 * compressed_len / original_len if original_len > 0 else 0.0,
             )
+        # CAAS — M7: trigger admission cooldown after compression events
+        if self.caas is not None and compressed_req_ids:
+            self.caas.on_compression_event(len(compressed_req_ids))
         return instructions, compressed_req_ids
 
     @staticmethod
@@ -1150,6 +1227,15 @@ class Scheduler(SchedulerInterface):
             if (is_completing_prefill
                     and self.kv_compression_config is not None):
                 request.needs_kv_compression = True
+
+            # CAAS — M8: per-request latency lifecycle hooks
+            if self.caas is not None:
+                _now_caas = time.monotonic()
+                if is_completing_prefill:
+                    self.caas.tracker.on_prefill_complete(req_id, _now_caas)
+                elif not was_prefill and not new_is_prefill:
+                    # Pure decode step
+                    self.caas.tracker.on_decode_step(req_id, _now_caas)
 
             # NOTE: _free_encoder_inputs relies on num_computed_tokens, which
             # may be updated again in _update_from_output for speculative
@@ -1911,6 +1997,13 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self.waiting.add_request(request)
             self.requests[request.request_id] = request
+            # CAAS — M10: register request for latency tracking
+            if self.caas is not None:
+                self.caas.tracker.register(
+                    request.request_id,
+                    request.arrival_time,
+                    request.num_prompt_tokens,
+                )
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
 
@@ -1970,6 +2063,10 @@ class Scheduler(SchedulerInterface):
         self, request: Request, delay_free_blocks: bool = False
     ) -> dict[str, Any] | None:
         assert request.is_finished()
+
+        # CAAS — M9: notify tracker that this request is done
+        if self.caas is not None:
+            self.caas.tracker.on_finish(request.request_id)
 
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)

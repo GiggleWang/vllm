@@ -534,6 +534,11 @@ class EngineArgs:
     enable_mm_processor_stats: bool = ObservabilityConfig.enable_mm_processor_stats
     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
     scheduler_cls: str | type[object] | None = SchedulerConfig.scheduler_cls
+    slo_ttft: float = SchedulerConfig.slo_ttft
+    slo_tpot: float = SchedulerConfig.slo_tpot
+    caas_cooldown_steps: int = SchedulerConfig.caas_cooldown_steps
+    caas_warmup_steps: int = SchedulerConfig.caas_warmup_steps
+    caas_forgetting_factor: float = SchedulerConfig.caas_forgetting_factor
 
     pooler_config: PoolerConfig | None = ModelConfig.pooler_config
     compilation_config: CompilationConfig = get_field(VllmConfig, "compilation_config")
@@ -1159,6 +1164,46 @@ class EngineArgs:
             "--scheduling-policy", **scheduler_kwargs["policy"]
         )
         scheduler_group.add_argument(
+            "--slo-ttft",
+            type=float,
+            default=SchedulerConfig.slo_ttft,
+            help="TTFT SLO target in seconds. When both --slo-ttft and "
+                 "--slo-tpot are > 0 and KV compression is enabled, the "
+                 "Compression-Aware Adaptive Scheduler (CAAS) is activated. "
+                 "Set to 0 to disable (default: 0).",
+        )
+        scheduler_group.add_argument(
+            "--slo-tpot",
+            type=float,
+            default=SchedulerConfig.slo_tpot,
+            help="TPOT SLO target in seconds. When both --slo-ttft and "
+                 "--slo-tpot are > 0 and KV compression is enabled, the "
+                 "Compression-Aware Adaptive Scheduler (CAAS) is activated. "
+                 "Set to 0 to disable (default: 0).",
+        )
+        scheduler_group.add_argument(
+            "--caas-cooldown-steps",
+            type=int,
+            default=SchedulerConfig.caas_cooldown_steps,
+            help="Number of scheduler steps to suppress new admissions after "
+                 "a KV compression event. Prevents batch size spikes. "
+                 "(default: 5)",
+        )
+        scheduler_group.add_argument(
+            "--caas-warmup-steps",
+            type=int,
+            default=SchedulerConfig.caas_warmup_steps,
+            help="Initial steps before CAAS cost model starts constraining "
+                 "admission. (default: 50)",
+        )
+        scheduler_group.add_argument(
+            "--caas-forgetting-factor",
+            type=float,
+            default=SchedulerConfig.caas_forgetting_factor,
+            help="Forgetting factor for CAAS RLS cost model. Lower = faster "
+                 "adaptation. (default: 0.95)",
+        )
+        scheduler_group.add_argument(
             "--enable-chunked-prefill",
             **{
                 **scheduler_kwargs["enable_chunked_prefill"],
@@ -1708,6 +1753,11 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
+            slo_ttft=self.slo_ttft,
+            slo_tpot=self.slo_tpot,
+            caas_cooldown_steps=self.caas_cooldown_steps,
+            caas_warmup_steps=self.caas_warmup_steps,
+            caas_forgetting_factor=self.caas_forgetting_factor,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:
