@@ -282,9 +282,9 @@ class Scheduler(SchedulerInterface):
                 tpot_slo=self.scheduler_config.slo_tpot,
                 base_max_running=self.max_num_running_reqs,
                 base_token_budget=self.max_num_scheduled_tokens,
-                cooldown_steps=self.scheduler_config.caas_cooldown_steps,
                 warmup_steps=self.scheduler_config.caas_warmup_steps,
                 forgetting_factor=self.scheduler_config.caas_forgetting_factor,
+                log_dir=self.scheduler_config.caas_log_dir,
             )
             logger.info(
                 "CAAS enabled: ttft_slo=%.1fs tpot_slo=%.3fs",

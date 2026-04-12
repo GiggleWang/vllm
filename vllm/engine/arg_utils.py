@@ -536,9 +536,9 @@ class EngineArgs:
     scheduler_cls: str | type[object] | None = SchedulerConfig.scheduler_cls
     slo_ttft: float = SchedulerConfig.slo_ttft
     slo_tpot: float = SchedulerConfig.slo_tpot
-    caas_cooldown_steps: int = SchedulerConfig.caas_cooldown_steps
     caas_warmup_steps: int = SchedulerConfig.caas_warmup_steps
     caas_forgetting_factor: float = SchedulerConfig.caas_forgetting_factor
+    caas_log_dir: str | None = SchedulerConfig.caas_log_dir
 
     pooler_config: PoolerConfig | None = ModelConfig.pooler_config
     compilation_config: CompilationConfig = get_field(VllmConfig, "compilation_config")
@@ -1182,14 +1182,6 @@ class EngineArgs:
                  "Set to 0 to disable (default: 0).",
         )
         scheduler_group.add_argument(
-            "--caas-cooldown-steps",
-            type=int,
-            default=SchedulerConfig.caas_cooldown_steps,
-            help="Number of scheduler steps to suppress new admissions after "
-                 "a KV compression event. Prevents batch size spikes. "
-                 "(default: 5)",
-        )
-        scheduler_group.add_argument(
             "--caas-warmup-steps",
             type=int,
             default=SchedulerConfig.caas_warmup_steps,
@@ -1202,6 +1194,14 @@ class EngineArgs:
             default=SchedulerConfig.caas_forgetting_factor,
             help="Forgetting factor for CAAS RLS cost model. Lower = faster "
                  "adaptation. (default: 0.95)",
+        )
+        scheduler_group.add_argument(
+            "--caas-log-dir",
+            type=str,
+            default=SchedulerConfig.caas_log_dir,
+            help="Directory for CAAS cost model CSV logs. When set, enables "
+                 "per-step logging of predicted vs actual step times. "
+                 "Filename includes a timestamp to avoid overwrites.",
         )
         scheduler_group.add_argument(
             "--enable-chunked-prefill",
@@ -1755,9 +1755,9 @@ class EngineArgs:
             stream_interval=self.stream_interval,
             slo_ttft=self.slo_ttft,
             slo_tpot=self.slo_tpot,
-            caas_cooldown_steps=self.caas_cooldown_steps,
             caas_warmup_steps=self.caas_warmup_steps,
             caas_forgetting_factor=self.caas_forgetting_factor,
+            caas_log_dir=self.caas_log_dir,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:

@@ -179,14 +179,13 @@ def _make_mock_request(req_id: str, is_prefill: bool, computed: int = 1000):
 class TestAdmissionController:
     def _make_ctrl(self, ttft_slo=10.0, tpot_slo=0.2,
                    base_max=128, base_budget=16384,
-                   cooldown=3, warmup=0):
+                   warmup=0):
         """warmup=0 so constraints are active immediately in tests."""
         return AdmissionController(
             ttft_slo=ttft_slo,
             tpot_slo=tpot_slo,
             base_max_running=base_max,
             base_token_budget=base_budget,
-            cooldown_steps=cooldown,
             warmup_steps=warmup,
             forgetting_factor=0.9,
         )
@@ -203,25 +202,53 @@ class TestAdmissionController:
         assert c.max_prefill_tokens == 16384
         assert c.admit_new is True
 
-    def test_compression_cooldown(self):
-        ctrl = self._make_ctrl(cooldown=3, warmup=0)
-        # Teach cost model something sensible
-        for _ in range(5):
-            ctrl.cost_model.update(50, 0, 50000, 0.05)
+    def test_compression_cooldown_immediate_admit_when_safe(self):
+        """Cost model predicts safe right after compression → admit immediately."""
+        ctrl = self._make_ctrl(tpot_slo=0.2, warmup=0)
+        # Teach cost model: step_time = 0.001 * N_decode (light load)
+        # With 10 decode requests, predicted for 11 = 0.011 << 0.2 SLO
+        for _ in range(10):
+            ctrl.cost_model.update(10, 0, 10000, 0.01)
 
-        running = [_make_mock_request(f"r{i}", False) for i in range(50)]
+        running = [_make_mock_request(f"r{i}", False) for i in range(10)]
+        ctrl.on_compression_event(3)
+
+        # Cost model says safe → admit_new=True immediately
+        c = ctrl.get_constraints(running, [])
+        assert c.admit_new is True
+
+    def test_compression_cooldown_held_when_unsafe(self):
+        """Cost model predicts unsafe → cooldown blocks admission."""
+        ctrl = self._make_ctrl(tpot_slo=0.1, warmup=0)
+        # Teach cost model: step_time ≈ 0.002 * N_decode
+        # With 60 requests, predicted for 61 = 0.122 > 0.1 SLO
+        for _ in range(10):
+            ctrl.cost_model.update(60, 0, 60000, 0.12)
+            ctrl.cost_model.update(50, 0, 50000, 0.10)
+
+        running = [_make_mock_request(f"r{i}", False) for i in range(60)]
         ctrl.on_compression_event(5)
 
-        # During cooldown: admit_new should be False
+        # Cost model says unsafe → blocked
         c = ctrl.get_constraints(running, [])
         assert c.admit_new is False
 
-        # After cooldown_steps, admit_new resumes
-        for _ in range(3):
-            ctrl.on_compression_event(0)  # no new event
-            ctrl.get_constraints(running, [])
-        # Cooldown expired after 3 decrements
+        # Still unsafe on next step → still blocked
         c = ctrl.get_constraints(running, [])
+        assert c.admit_new is False
+
+    def test_compression_cooldown_clears_when_running_empty(self):
+        """Cooldown must not block admission when running queue is empty."""
+        ctrl = self._make_ctrl(tpot_slo=0.1, warmup=0)
+        # Teach cost model with heavy load so predict(1,0,0) might exceed SLO
+        for _ in range(20):
+            ctrl.cost_model.update(60, 0, 60000, 0.12)
+
+        ctrl.on_compression_event(5)
+
+        # All requests finished → running is empty
+        c = ctrl.get_constraints([], [])
+        # Must allow admission — nothing to cool down from
         assert c.admit_new is True
 
     def test_tpot_emergency_brake(self):
@@ -243,8 +270,7 @@ class TestAdmissionController:
         assert c.max_prefill_tokens == 128
 
     def test_antistarvation_overrides_cooldown(self):
-        ctrl = self._make_ctrl(ttft_slo=5.0, tpot_slo=0.2, cooldown=10,
-                               warmup=0)
+        ctrl = self._make_ctrl(ttft_slo=5.0, tpot_slo=0.2, warmup=0)
         for _ in range(5):
             ctrl.cost_model.update(50, 0, 50000, 0.05)
 

@@ -149,11 +149,6 @@ class SchedulerConfig:
     (CAAS). When both slo_ttft > 0 and slo_tpot > 0 and KV compression is
     enabled, CAAS is automatically activated. Set to 0 to disable."""
 
-    caas_cooldown_steps: int = 5
-    """Number of scheduler steps to suppress new request admissions after a KV
-    compression event frees blocks. Prevents sudden batch size spikes that
-    degrade TPOT."""
-
     caas_warmup_steps: int = 50
     """Number of initial steps before CAAS cost model begins constraining
     admission. During warmup, the baseline (static) limits are used."""
@@ -161,6 +156,11 @@ class SchedulerConfig:
     caas_forgetting_factor: float = 0.95
     """Forgetting factor for the CAAS exponentially-weighted RLS cost model.
     Lower values adapt faster to workload changes but are noisier."""
+
+    caas_log_dir: str | None = None
+    """Directory for CAAS cost model CSV logs. When set, enables per-step
+    logging of predicted vs actual step times. Filename includes a timestamp
+    to avoid overwrites."""
 
     @staticmethod
     def default_factory(**kwargs):

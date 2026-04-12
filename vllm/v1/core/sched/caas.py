@@ -14,9 +14,12 @@ still maximising goodput (fraction of requests meeting both TTFT and TPOT SLOs).
 
 from __future__ import annotations
 
+import csv
+import io
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -139,8 +142,15 @@ class StepCostModel:
     using forgetting factor λ so the model adapts to workload changes.
     """
 
+    _CSV_HEADER = [
+        "step", "timestamp", "n_decode", "prefill_tokens", "total_kv",
+        "predicted_sec", "actual_sec", "error_sec", "error_pct",
+        "w0", "w1", "w2", "w3", "is_warmed_up",
+    ]
+
     def __init__(self, forgetting_factor: float = 0.95,
-                 warmup_steps: int = 50) -> None:
+                 warmup_steps: int = 50,
+                 log_dir: str | None = None) -> None:
         self.lam = forgetting_factor
         self.warmup_steps = warmup_steps
         self._n_features = 4
@@ -148,6 +158,20 @@ class StepCostModel:
         # Large initial P → high uncertainty, fast early adaptation
         self._P = np.eye(self._n_features, dtype=np.float64) * 1e4
         self._step_count = 0
+
+        # CSV logging
+        self._csv_file: io.TextIOWrapper | None = None
+        self._csv_writer: csv.writer | None = None
+        if log_dir is not None:
+            log_path = Path(log_dir)
+            log_path.mkdir(parents=True, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            csv_path = log_path / f"caas_cost_model_{ts}.csv"
+            self._csv_file = open(csv_path, "w", newline="")
+            self._csv_writer = csv.writer(self._csv_file)
+            self._csv_writer.writerow(self._CSV_HEADER)
+            self._csv_file.flush()
+            logger.info("CAAS cost model logging to %s", csv_path)
 
     @property
     def is_warmed_up(self) -> bool:
@@ -169,6 +193,32 @@ class StepCostModel:
     def update(self, n_decode: int, prefill_toks: int, total_kv: int,
                actual_time: float) -> None:
         """Update model with observed step duration."""
+        # Log prediction-vs-actual BEFORE updating weights
+        if self._csv_writer is not None:
+            predicted = self.predict(n_decode, prefill_toks, total_kv)
+            error_sec = predicted - actual_time
+            error_pct = (
+                error_sec / actual_time * 100.0
+                if actual_time > 0 else float("nan")
+            )
+            self._csv_writer.writerow([
+                self._step_count,
+                f"{time.time():.6f}",
+                n_decode,
+                prefill_toks,
+                total_kv,
+                f"{predicted:.9f}",
+                f"{actual_time:.9f}",
+                f"{error_sec:.9f}",
+                f"{error_pct:.4f}",
+                f"{self._w[0]:.9f}",
+                f"{self._w[1]:.9f}",
+                f"{self._w[2]:.9f}",
+                f"{self._w[3]:.9f}",
+                self.is_warmed_up,
+            ])
+            self._csv_file.flush()
+
         x = self._features(n_decode, prefill_toks, total_kv)
         Px = self._P @ x
         denom = self.lam + float(x @ Px)
@@ -179,6 +229,13 @@ class StepCostModel:
         self._w += K * error
         self._P = (self._P - np.outer(K, Px)) / self.lam
         self._step_count += 1
+
+    def close_log(self) -> None:
+        """Close the CSV log file if open."""
+        if self._csv_file is not None:
+            self._csv_file.close()
+            self._csv_file = None
+            self._csv_writer = None
 
 
 # ---------------------------------------------------------------------------
@@ -209,32 +266,32 @@ class AdmissionController:
         tpot_slo: float,
         base_max_running: int,
         base_token_budget: int,
-        cooldown_steps: int = 5,
         warmup_steps: int = 50,
         forgetting_factor: float = 0.95,
+        log_dir: str | None = None,
     ) -> None:
         self.ttft_slo = ttft_slo
         self.tpot_slo = tpot_slo
         self._base_max_running = base_max_running
         self._base_token_budget = base_token_budget
-        self._cooldown_steps = cooldown_steps
 
         self.cost_model = StepCostModel(
             forgetting_factor=forgetting_factor,
             warmup_steps=warmup_steps,
+            log_dir=log_dir,
         )
         self.tracker = RequestTracker()
 
-        self._compression_cooldown: int = 0
+        self._in_post_compression: bool = False
 
     def on_compression_event(self, num_compressed: int) -> None:
         """Signal that KV compression just freed blocks for `num_compressed`
-        requests.  Triggers an admission cooldown."""
+        requests.  Enters cost-model-gated observation period."""
         if num_compressed > 0:
-            self._compression_cooldown = self._cooldown_steps
+            self._in_post_compression = True
             logger.debug(
-                "CAAS: compression event (%d reqs) → cooldown %d steps",
-                num_compressed, self._cooldown_steps,
+                "CAAS: compression event (%d reqs) → cost-model cooldown",
+                num_compressed,
             )
 
     def get_constraints(
@@ -282,17 +339,22 @@ class AdmissionController:
         )
         max_prefill_tokens = max(max_prefill_tokens, 128)  # ensure progress
 
-        # 3) Compression cooldown: suppress admission for N steps after
-        #    compression events to avoid instant batch bloat
+        # 3) Post-compression cost-model-gated cooldown
         admit_new = True
-        if self._compression_cooldown > 0:
-            self._compression_cooldown -= 1
-            admit_new = False
-            max_decode_batch = min(max_decode_batch, len(running))
-            logger.debug(
-                "CAAS: cooldown active (%d steps left), max_batch=%d",
-                self._compression_cooldown + 1, max_decode_batch,
-            )
+        if self._in_post_compression and len(running) > 0:
+            # Ask cost model whether admitting one more request would
+            # still stay within the TPOT SLO.
+            predicted = self.cost_model.predict(
+                n_decode + 1, 0, int((n_decode + 1) * avg_kv))
+            if predicted <= self.tpot_slo:
+                self._in_post_compression = False
+                logger.debug("CAAS: cooldown lifted (predicted "
+                             "%.3fs <= SLO %.3fs)", predicted, self.tpot_slo)
+            else:
+                admit_new = False
+                max_decode_batch = min(max_decode_batch, len(running))
+                logger.debug("CAAS: cooldown held (predicted "
+                             "%.3fs > SLO %.3fs)", predicted, self.tpot_slo)
 
         # 4) TPOT emergency brake: observed TPOT already exceeds SLO
         worst_tpot = self.tracker.get_worst_active_tpot()
