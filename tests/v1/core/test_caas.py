@@ -131,21 +131,29 @@ class TestStepCostModel:
         assert m.is_warmed_up
 
     def test_update_improves_prediction(self):
-        """After many updates the model should converge toward actual values."""
+        """After many updates the linear path should converge toward
+        actual values on mixed (prefill>0) steps."""
         m = StepCostModel(warmup_steps=5, forgetting_factor=0.99)
-        # Ground truth: step_time = 0.001 * n_decode + 0.00001 * total_kv + 0.01
+        # Ground truth: step_time = 0.00005*prf + 0.0000005*kv + 0.01
+        # (prf-heavy workload — quantile path does not apply because
+        # prefill_toks > 0.)
         rng = np.random.default_rng(42)
-        for _ in range(200):
+        for _ in range(400):
             n = int(rng.integers(10, 100))
-            kv = int(rng.integers(1000, 50000))
-            true_time = 0.001 * n + 0.00001 * kv + 0.01
-            noisy_time = true_time + rng.normal(0, 0.001)
-            m.update(n, 0, kv, noisy_time)
+            prf = int(rng.integers(500, 4000))
+            kv = int(rng.integers(10_000, 200_000))
+            true_time = 0.00005 * prf + 0.0000005 * kv + 0.01
+            noisy_time = true_time + rng.normal(0, 0.002)
+            m.update(n, prf, kv, noisy_time)
 
-        # After convergence, prediction should be close
-        pred = m.predict(50, 0, 20000)
-        expected = 0.001 * 50 + 0.00001 * 20000 + 0.01
-        assert abs(pred - expected) < 0.005, f"pred={pred:.4f} expected={expected:.4f}"
+        # After convergence, prediction should be close on a held-out
+        # mixed-step query. Tolerance is ~25ms (≈ 20% of the ground-truth
+        # value) — the shrinkage regularizer biases converged weights
+        # slightly toward 0, so we don't expect sub-millisecond accuracy.
+        pred = m.predict(50, 2000, 50000)
+        expected = 0.00005 * 2000 + 0.0000005 * 50000 + 0.01
+        assert abs(pred - expected) < 0.03, (
+            f"pred={pred:.4f} expected={expected:.4f}")
 
     def test_prefill_feature_learned(self):
         """Model should learn prefill token cost independently."""
@@ -153,15 +161,104 @@ class TestStepCostModel:
         rng = np.random.default_rng(7)
         for _ in range(200):
             n = 50
-            p = int(rng.integers(0, 2000))
+            p = int(rng.integers(1, 2000))
             kv = 20000
             true_time = 0.001 * n + 0.0001 * p + 0.00001 * kv + 0.01
             m.update(n, p, kv, true_time + rng.normal(0, 0.002))
 
-        # With 500 prefill tokens vs 0, prediction should differ noticeably
+        # With 500 prefill tokens vs 0, prediction should differ noticeably.
+        # Compare two mixed-step queries so both go through the linear
+        # path (prefill_toks > 0).
         pred_with = m.predict(50, 500, 20000)
-        pred_without = m.predict(50, 0, 20000)
+        pred_without = m.predict(50, 1, 20000)
         assert pred_with > pred_without
+
+    def test_weights_always_non_negative(self):
+        """RLS weights must stay non-negative after every update —
+        physical constraint."""
+        m = StepCostModel(warmup_steps=5, forgetting_factor=0.99)
+        rng = np.random.default_rng(0)
+        for _ in range(500):
+            n = int(rng.integers(1, 150))
+            p = int(rng.integers(0, 8000))
+            kv = int(rng.integers(0, 500_000))
+            # Plausible physical step time + noise
+            true_time = (
+                0.01 + 5e-5 * p + 5e-7 * kv + 2.8e-9 * p * (kv / max(n, 1))
+            )
+            m.update(n, p, kv, true_time + rng.normal(0, 0.003))
+            assert (m._w >= 0).all(), (
+                f"negative weight appeared: {m._w}")
+
+    def test_adversarial_spike_does_not_destabilize(self):
+        """A single huge spike slipping past the 5s filter (or residual
+        filter) must not permanently corrupt the weights."""
+        m = StepCostModel(warmup_steps=5, forgetting_factor=0.99)
+        rng = np.random.default_rng(11)
+        # 100 clean observations
+        for _ in range(100):
+            n = int(rng.integers(10, 80))
+            p = int(rng.integers(500, 3000))
+            kv = int(rng.integers(10_000, 100_000))
+            true_time = 5e-5 * p + 5e-7 * kv + 0.01
+            m.update(n, p, kv, true_time + rng.normal(0, 0.001))
+
+        baseline_pred = m.predict(50, 2000, 50000)
+        baseline_w = m._w.copy()
+
+        # Adversarial spike: claims to be 4.9s (just under the 5s hard
+        # cap) on a feature vector the model thinks should be ~0.12s.
+        # The relative-residual filter should catch it.
+        m.update(50, 2000, 50000, 4.9)
+
+        post_pred = m.predict(50, 2000, 50000)
+        assert abs(post_pred - baseline_pred) < 0.05, (
+            f"spike moved prediction: before={baseline_pred:.4f} "
+            f"after={post_pred:.4f}")
+        # Weights should be essentially unchanged
+        assert np.allclose(m._w, baseline_w, atol=0.5), (
+            f"spike moved weights: before={baseline_w} after={m._w}")
+
+    def test_repeated_identical_input_does_not_windup(self):
+        """Feeding the same observation thousands of times must not let
+        the covariance explode (the failure mode in production traces).
+
+        Without the cap, λ=0.95 would grow unexcited-direction entries by
+        1/0.95^5000 ≈ 10^111 — here we check that every diagonal stays
+        at or below the cap instead."""
+        m = StepCostModel(warmup_steps=5, forgetting_factor=0.95)
+        cap = StepCostModel._P_MAX_DIAG
+        for _ in range(5000):
+            m.update(33, 0, 767_000, 0.058)
+        # No diagonal entry may exceed the configured cap (+ tiny
+        # floating-point slack).
+        diag = np.diag(m._P)
+        assert (diag <= cap * 1.0001).all(), (
+            f"covariance wind-up: diag={diag}")
+        # Weights must be finite and non-negative
+        assert np.all(np.isfinite(m._w))
+        assert (m._w >= 0).all()
+        # Prediction on the trained input must stay close to the target
+        pred = m.predict(33, 0, 767_000)
+        assert abs(pred - 0.058) < 0.01, f"pred drifted: {pred:.4f}"
+
+    def test_pure_decode_uses_quantile_after_warmup(self):
+        """Pure-decode predict path should switch to empirical p90 once
+        the bucket has enough samples, ignoring the linear fit."""
+        m = StepCostModel(warmup_steps=5, forgetting_factor=0.99)
+        rng = np.random.default_rng(3)
+        n, kv = 30, 100_000
+        samples = []
+        for _ in range(50):
+            actual = 0.04 + rng.normal(0, 0.005)
+            samples.append(actual)
+            m.update(n, 0, kv, actual)
+        p90_empirical = float(np.percentile(samples, 90))
+        pred = m.predict(n, 0, kv)
+        # Quantile path should now be active — prediction is the
+        # bucket's rolling p90, not the linear-model output.
+        assert abs(pred - p90_empirical) < 0.01, (
+            f"pred={pred:.4f} p90={p90_empirical:.4f}")
 
 
 # ---------------------------------------------------------------------------

@@ -270,9 +270,15 @@ class Scheduler(SchedulerInterface):
 
         # Compression-Aware Adaptive Scheduler (CAAS) — M1
         self.caas: "AdmissionController | None" = None
-        self._caas_last_schedule_time: float = 0.0
-        # Features from the previous step used to update the cost model
-        self._caas_last_features: tuple[int, int, int] | None = None
+        # FIFO of (schedule_start_time, features) for steps that have been
+        # scheduled but not yet seen by update_from_output(). We intentionally
+        # measure the step duration as (end_of_update_from_output −
+        # start_of_schedule) for the SAME step so idle gaps between successive
+        # engine iterations never leak into the cost-model training signal.
+        # A deque (not a single variable) is required because batch-queue /
+        # async scheduling can call schedule() for step N+1 before
+        # update_from_output() runs for step N.
+        self._caas_pending_steps: "deque[tuple[float, tuple[int, int, int]]]" = deque()
         if (self.kv_compression_config is not None
                 and self.scheduler_config.slo_ttft > 0
                 and self.scheduler_config.slo_tpot > 0):
@@ -411,17 +417,15 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
-        # CAAS — M2: update cost model with previous step's actual time,
-        # then compute admission constraints for this step.
+        # CAAS — M2: compute admission constraints for this step.
+        # Note: the cost-model update for the previous step happens in
+        # update_from_output(), not here. Using schedule→update duration
+        # (instead of schedule→schedule) avoids contaminating the training
+        # signal with idle gaps between engine iterations.
         caas_constraints = None
+        _caas_step_start_time = 0.0
         if self.caas is not None:
-            now_caas = time.monotonic()
-            if (self._caas_last_schedule_time > 0
-                    and self._caas_last_features is not None):
-                actual_step_time = now_caas - self._caas_last_schedule_time
-                self.caas.cost_model.update(
-                    *self._caas_last_features, actual_step_time)
-            self._caas_last_schedule_time = now_caas
+            _caas_step_start_time = scheduled_timestamp
             caas_constraints = self.caas.get_constraints(
                 self.running, list(self.waiting))
 
@@ -911,7 +915,10 @@ class Scheduler(SchedulerInterface):
         assert token_budget >= 0
         assert len(self.running) <= self.max_num_running_reqs
 
-        # CAAS — M6: record step features for next-step cost model update
+        # CAAS — M6: record step features and start time for the cost-model
+        # update that will happen at the end of update_from_output() for this
+        # same step. We only enqueue steps that actually do work; empty
+        # scheduling rounds contain no signal for the forward-time model.
         if self.caas is not None and num_scheduled_tokens:
             n_dec = sum(
                 1 for v in num_scheduled_tokens.values() if v == 1)
@@ -921,7 +928,8 @@ class Scheduler(SchedulerInterface):
                 self.requests[rid].num_computed_tokens
                 for rid in num_scheduled_tokens
             )
-            self._caas_last_features = (n_dec, p_tok, t_kv)
+            self._caas_pending_steps.append(
+                (_caas_step_start_time, (n_dec, p_tok, t_kv)))
         # Since some requests in the RUNNING queue may not be scheduled in
         # this step, the total number of scheduled requests can be smaller than
         # len(self.running).
@@ -1827,6 +1835,15 @@ class Scheduler(SchedulerInterface):
                 # outputs this step.
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
+
+        # CAAS — feed the cost model with the duration of the step whose
+        # output we just finished processing. Using end_of_update − start_of_schedule
+        # (rather than schedule→schedule delta) excludes any idle time the
+        # engine loop spent waiting between iterations.
+        if self.caas is not None and self._caas_pending_steps:
+            start_time, features = self._caas_pending_steps.popleft()
+            step_duration = time.monotonic() - start_time
+            self.caas.cost_model.update(*features, step_duration)
 
         return engine_core_outputs
 

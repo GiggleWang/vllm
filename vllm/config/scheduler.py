@@ -153,9 +153,12 @@ class SchedulerConfig:
     """Number of initial steps before CAAS cost model begins constraining
     admission. During warmup, the baseline (static) limits are used."""
 
-    caas_forgetting_factor: float = 0.95
+    caas_forgetting_factor: float = 0.999
     """Forgetting factor for the CAAS exponentially-weighted RLS cost model.
-    Lower values adapt faster to workload changes but are noisier."""
+    Lower values adapt faster to workload changes but are noisier. The
+    default of 0.999 gives an effective memory of ~1000 steps; values much
+    below 0.99 cause covariance wind-up on real workloads where the
+    scheduler sees long runs of near-identical feature vectors."""
 
     caas_log_dir: str | None = None
     """Directory for CAAS cost model CSV logs. When set, enables per-step
