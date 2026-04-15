@@ -219,6 +219,15 @@ class RequestStateStats:
     # Track if this request is corrupted (NaNs in logits)
     is_corrupted: bool = False
 
+    # SLO targets copied from the request (ms); None = no SLO.
+    slo_ttft_ms: int | None = None
+    slo_tpot_ms: int | None = None
+    slo_e2e_ms: int | None = None
+
+    # SLO violation tracking.
+    ttft_violated: bool = False
+    tpot_violation_count: int = 0
+
 
 @dataclass
 class FinishedRequestStats:
@@ -236,6 +245,13 @@ class FinishedRequestStats:
     mean_time_per_output_token: float = 0.0
     is_corrupted: bool = False
     num_cached_tokens: int = 0
+
+    # SLO violation results (populated at finish time).
+    ttft_violated: bool = False
+    tpot_violated: bool = False
+    e2e_violated: bool = False
+    ttft_slack_s: float = 0.0   # positive = on time, negative = missed
+    e2e_slack_s: float = 0.0
 
 
 @dataclass
@@ -368,6 +384,10 @@ class IterationStats:
             first_token_latency = self._time_since(req_stats.arrival_time)
             self.time_to_first_tokens_iter.append(first_token_latency)
             req_stats.first_token_latency = first_token_latency
+            # SLO: check TTFT violation.
+            if (req_stats.slo_ttft_ms is not None
+                    and first_token_latency * 1000.0 > req_stats.slo_ttft_ms):
+                req_stats.ttft_violated = True
 
         req_stats.num_generation_tokens += num_new_generation_tokens
 
@@ -397,6 +417,10 @@ class IterationStats:
         else:
             itl = engine_core_timestamp - req_stats.last_token_ts
             self.inter_token_latencies_iter.append(itl)
+            # SLO: count TPOT violations.
+            if (req_stats.slo_tpot_ms is not None
+                    and itl * 1000.0 > req_stats.slo_tpot_ms):
+                req_stats.tpot_violation_count += 1
 
         req_stats.last_token_ts = engine_core_timestamp
 
@@ -456,6 +480,22 @@ class IterationStats:
             else 0
         )
 
+        # SLO violation results.
+        ttft_violated = req_stats.ttft_violated
+        tpot_violated = req_stats.tpot_violation_count > 0
+        e2e_violated = (
+            req_stats.slo_e2e_ms is not None
+            and e2e_latency * 1000.0 > req_stats.slo_e2e_ms
+        )
+        ttft_slack_s = (
+            (req_stats.slo_ttft_ms / 1000.0 - req_stats.first_token_latency)
+            if req_stats.slo_ttft_ms is not None else 0.0
+        )
+        e2e_slack_s = (
+            (req_stats.slo_e2e_ms / 1000.0 - e2e_latency)
+            if req_stats.slo_e2e_ms is not None else 0.0
+        )
+
         finished_req = FinishedRequestStats(
             finish_reason=finish_reason,
             e2e_latency=e2e_latency,
@@ -469,6 +509,11 @@ class IterationStats:
             mean_time_per_output_token=mean_time_per_output_token,
             is_corrupted=req_stats.is_corrupted,
             num_cached_tokens=num_cached_tokens,
+            ttft_violated=ttft_violated,
+            tpot_violated=tpot_violated,
+            e2e_violated=e2e_violated,
+            ttft_slack_s=ttft_slack_s,
+            e2e_slack_s=e2e_slack_s,
         )
         self.finished_requests.append(finished_req)
 

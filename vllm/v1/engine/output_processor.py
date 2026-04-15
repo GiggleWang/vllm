@@ -149,6 +149,9 @@ class RequestState:
         n: int | None = None,
         temperature: float | None = None,
         stream_input: bool = False,
+        slo_ttft_ms: int | None = None,
+        slo_tpot_ms: int | None = None,
+        slo_e2e_ms: int | None = None,
     ):
         self.request_id = request_id
         self.external_req_id = external_req_id
@@ -173,7 +176,15 @@ class RequestState:
         self.queue = queue
         self.num_cached_tokens = 0
 
-        self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
+        self.stats = (
+            RequestStateStats(
+                arrival_time=arrival_time,
+                slo_ttft_ms=slo_ttft_ms,
+                slo_tpot_ms=slo_tpot_ms,
+                slo_e2e_ms=slo_e2e_ms,
+            )
+            if log_stats else None
+        )
 
         # Stream Interval
         self.stream_interval = stream_interval
@@ -242,6 +253,12 @@ class RequestState:
             assert request.pooling_params is not None
             output_kind = request.pooling_params.output_kind
 
+        # Extract SLO fields from sampling_params if present.
+        _sp = request.sampling_params
+        slo_ttft_ms = _sp.slo_ttft_ms if _sp is not None else None
+        slo_tpot_ms = _sp.slo_tpot_ms if _sp is not None else None
+        slo_e2e_ms = _sp.slo_e2e_ms if _sp is not None else None
+
         assert request.external_req_id is not None
         return cls(
             request_id=request.request_id,
@@ -264,6 +281,9 @@ class RequestState:
             log_stats=log_stats,
             stream_interval=stream_interval,
             stream_input=request.resumable,
+            slo_ttft_ms=slo_ttft_ms,
+            slo_tpot_ms=slo_tpot_ms,
+            slo_e2e_ms=slo_e2e_ms,
         )
 
     def make_request_output(

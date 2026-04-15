@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
-SchedulerPolicy = Literal["fcfs", "priority"]
+SchedulerPolicy = Literal["fcfs", "priority", "slo"]
 
 
 @config
@@ -109,10 +109,55 @@ class SchedulerConfig:
     policy: SchedulerPolicy = "fcfs"
     """The scheduling policy to use:
 
-    - "fcfs" means first come first served, i.e. requests are handled in order 
+    - "fcfs" means first come first served, i.e. requests are handled in order
       of arrival.
     - "priority" means requests are handled based on given priority (lower
-      value means earlier handling) and time of arrival deciding any ties)."""
+      value means earlier handling) and time of arrival deciding any ties).
+    - "slo" means SLO-aware scheduling: requests are ordered by deadline
+      urgency and the batch token budget is dynamically capped to keep
+      per-step latency within running requests' SLO budgets. Requires
+      ``slo_enable=True``."""
+
+    # -----------------------------------------------------------------------
+    # SLO-aware scheduling configuration (used when policy="slo")
+    # -----------------------------------------------------------------------
+
+    slo_enable: bool = False
+    """Enable SLO-aware temporal and spatial scheduling.
+    Requires ``--scheduling-policy slo``."""
+
+    slo_predictor: Literal["heuristic", "offline", "online"] = "heuristic"
+    """Latency predictor backend for SLO spatial scheduling.
+
+    - "heuristic": affine model with hard-coded default coefficients.
+    - "offline":   affine model loaded from ``slo_profile_path``.
+    - "online":    online EMA-updated linear regression; uses heuristic
+                   during warm-up.
+    """
+
+    slo_profile_path: str | None = None
+    """Path to JSON profile produced by ``vllm/tools/profile_step_latency.py``.
+    Required when ``slo_predictor="offline"``; ignored otherwise."""
+
+    slo_step_latency_headroom: float = Field(default=0.8, gt=0.0, le=1.0)
+    """Safety factor applied to the tightest per-step slack when computing
+    the SLO token budget.  0.8 means we target 80% of the available slack,
+    leaving a 20% margin for prediction error."""
+
+    slo_default_tpot_ms: int = Field(default=50, ge=1)
+    """Default TPOT budget in milliseconds used for urgency normalisation when
+    a request carries no explicit ``slo_tpot_ms``."""
+
+    slo_admission: Literal["defer", "preempt"] = "defer"
+    """How to handle a waiting request whose TTFT slack is negative while all
+    sequence slots are full.
+
+    - "defer":   the waiting request stays at the front of the queue and is
+                 admitted as soon as a slot opens (default; no KV eviction).
+    - "preempt": the least-urgent running request is preempted to make room,
+                 freeing its KV blocks (higher SLO attainment at the cost of
+                 wasted prefill work).
+    """
 
     disable_chunked_mm_input: bool = False
     """If set to true and chunked prefill is enabled, we do not want to

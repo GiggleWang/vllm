@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import heapq
+import time
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Iterable, Iterator
@@ -15,6 +16,7 @@ class SchedulingPolicy(Enum):
 
     FCFS = "fcfs"
     PRIORITY = "priority"
+    SLO = "slo"
 
 
 class RequestQueue(ABC):
@@ -198,11 +200,87 @@ class PriorityRequestQueue(RequestQueue):
             yield heapq.heappop(heap_copy)
 
 
-def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
+class SLORequestQueue(RequestQueue):
+    """An SLO-aware queue ordered by request urgency at peek/pop time.
+
+    Internally stores requests in an unsorted list.  On each ``peek_request``
+    or ``pop_request`` call the list is sorted by
+    ``(urgency, arrival_time, request_id)`` using the current monotonic time.
+    This yields correct EDF-style ordering without requiring a heap whose keys
+    would go stale as time passes.
+
+    The list length is bounded by ``max_num_seqs`` (typically a few hundred),
+    so O(N log N) sorting per scheduling step is negligible compared to a GPU
+    forward pass.
+    """
+
+    def __init__(self, default_tpot_s: float = 0.05) -> None:
+        self._items: list[Request] = []
+        self._default_tpot_s = default_tpot_s
+
+    def _sort_key(self, req: Request) -> tuple[float, float, str]:
+        from vllm.v1.core.sched.slo.urgency import request_urgency
+        now = time.monotonic()
+        return (
+            request_urgency(req, now, self._default_tpot_s),
+            req.arrival_time,
+            req.request_id,
+        )
+
+    def _resort(self) -> None:
+        self._items.sort(key=self._sort_key)
+
+    def add_request(self, request: Request) -> None:
+        self._items.append(request)
+
+    def pop_request(self) -> Request:
+        if not self._items:
+            raise IndexError("pop from empty SLORequestQueue")
+        self._resort()
+        return self._items.pop(0)
+
+    def peek_request(self) -> Request:
+        if not self._items:
+            raise IndexError("peek from empty SLORequestQueue")
+        self._resort()
+        return self._items[0]
+
+    def prepend_request(self, request: Request) -> None:
+        # In a deadline-ordered queue there is no "front"; just add.
+        self._items.append(request)
+
+    def prepend_requests(self, requests: RequestQueue) -> None:
+        for req in requests:
+            self._items.append(req)
+
+    def remove_request(self, request: Request) -> None:
+        self._items.remove(request)
+
+    def remove_requests(self, requests: Iterable[Request]) -> None:
+        to_remove = requests if isinstance(requests, set) else set(requests)
+        self._items = [r for r in self._items if r not in to_remove]
+
+    def __bool__(self) -> bool:
+        return bool(self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __iter__(self) -> Iterator[Request]:
+        self._resort()
+        return iter(list(self._items))
+
+
+def create_request_queue(
+    policy: SchedulingPolicy,
+    default_tpot_s: float = 0.05,
+) -> RequestQueue:
     """Create request queue based on scheduling policy."""
     if policy == SchedulingPolicy.PRIORITY:
         return PriorityRequestQueue()
     elif policy == SchedulingPolicy.FCFS:
         return FCFSRequestQueue()
+    elif policy == SchedulingPolicy.SLO:
+        return SLORequestQueue(default_tpot_s=default_tpot_s)
     else:
         raise ValueError(f"Unknown scheduling policy: {policy}")

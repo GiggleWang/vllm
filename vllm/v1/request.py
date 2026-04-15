@@ -173,6 +173,27 @@ class Request:
         # None entry in the queue means finished.
         self.streaming_queue: deque[StreamingUpdate | None] | None = None
 
+        # SLO fields: deadline timestamps in monotonic clock domain.
+        # Computed once at Request construction time.
+        self.mono_arrival_ts: float = time.monotonic()
+        if sampling_params is not None:
+            _ttft_ms = sampling_params.slo_ttft_ms
+            _tpot_ms = sampling_params.slo_tpot_ms
+            _e2e_ms = sampling_params.slo_e2e_ms
+        else:
+            _ttft_ms = _tpot_ms = _e2e_ms = None
+        self.ttft_deadline_ts: float | None = (
+            self.mono_arrival_ts + _ttft_ms / 1000.0 if _ttft_ms is not None else None
+        )
+        self.tpot_budget_s: float | None = (
+            _tpot_ms / 1000.0 if _tpot_ms is not None else None
+        )
+        self.e2e_deadline_ts: float | None = (
+            self.mono_arrival_ts + _e2e_ms / 1000.0 if _e2e_ms is not None else None
+        )
+        # Updated by the scheduler each time a new output token is produced.
+        self.last_token_mono_ts: float | None = None
+
     @classmethod
     def from_engine_core_request(
         cls,
@@ -209,6 +230,9 @@ class Request:
             self._all_token_ids.extend(token_ids)
 
         self.update_block_hashes()
+        # Record monotonic timestamp of the latest token for TPOT SLO tracking.
+        if self.tpot_budget_s is not None or self.e2e_deadline_ts is not None:
+            self.last_token_mono_ts = time.monotonic()
 
     def update_block_hashes(self) -> None:
         """Compute block hashes for any new full blocks and append them."""

@@ -306,6 +306,22 @@ class SamplingParams(
     '\\emoji \\emoji \\emoji ...'). This feature can detect such behavior
     and terminate early, saving time and tokens."""
 
+    # SLO (Service Level Objective) fields.
+    # Used by the SLO-aware scheduler (--scheduling-policy slo).
+    slo_ttft_ms: int | None = None
+    """Target time-to-first-token in milliseconds, measured from request
+    arrival. The SLO-aware scheduler will prioritize requests whose TTFT
+    deadline is approaching. None = no TTFT SLO for this request."""
+
+    slo_tpot_ms: int | None = None
+    """Target max inter-token latency in milliseconds (aka ITL / TPOT).
+    The SLO-aware scheduler will cap the batch size to keep per-step latency
+    within this budget. None = no TPOT SLO for this request."""
+
+    slo_e2e_ms: int | None = None
+    """Target wall-clock end-to-end completion deadline in milliseconds from
+    request arrival. None = no end-to-end SLO for this request."""
+
     @staticmethod
     def from_optional(
         n: int | None = 1,
@@ -337,6 +353,9 @@ class SamplingParams(
         extra_args: dict[str, Any] | None = None,
         skip_clone: bool = False,
         repetition_detection: RepetitionDetectionParams | None = None,
+        slo_ttft_ms: int | None = None,
+        slo_tpot_ms: int | None = None,
+        slo_e2e_ms: int | None = None,
     ) -> "SamplingParams":
         if logit_bias is not None:
             # Convert token_id to integer
@@ -378,6 +397,9 @@ class SamplingParams(
             extra_args=extra_args,
             skip_clone=skip_clone,
             repetition_detection=repetition_detection,
+            slo_ttft_ms=slo_ttft_ms,
+            slo_tpot_ms=slo_tpot_ms,
+            slo_e2e_ms=slo_e2e_ms,
         )
 
     def __post_init__(self) -> None:
@@ -527,6 +549,15 @@ class SamplingParams(
                 "stop strings are only supported when detokenize is True. "
                 "Set detokenize=True to use stop."
             )
+        for slo_field, slo_name in (
+            (self.slo_ttft_ms, "slo_ttft_ms"),
+            (self.slo_tpot_ms, "slo_tpot_ms"),
+            (self.slo_e2e_ms, "slo_e2e_ms"),
+        ):
+            if slo_field is not None and slo_field < 1:
+                raise ValueError(
+                    f"{slo_name} must be a positive integer (ms), got {slo_field}."
+                )
 
     def _verify_greedy_sampling(self) -> None:
         if self.n > 1:

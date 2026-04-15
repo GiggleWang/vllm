@@ -917,6 +917,58 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             histogram_decode_time_request, per_engine_labelvalues
         )
 
+        # SLO metrics.
+        slo_slack_buckets = [-5.0, -2.0, -1.0, -0.5, -0.2, -0.1,
+                             0.0, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0]
+        counter_slo_ttft_violations = self._counter_cls(
+            name="vllm:slo_ttft_violations_total",
+            documentation="Total requests that missed their TTFT SLO.",
+            labelnames=labelnames,
+        )
+        self.counter_slo_ttft_violations = create_metric_per_engine(
+            counter_slo_ttft_violations, per_engine_labelvalues
+        )
+        counter_slo_tpot_violations = self._counter_cls(
+            name="vllm:slo_tpot_violations_total",
+            documentation="Total requests with ≥1 inter-token latency exceeding TPOT SLO.",
+            labelnames=labelnames,
+        )
+        self.counter_slo_tpot_violations = create_metric_per_engine(
+            counter_slo_tpot_violations, per_engine_labelvalues
+        )
+        counter_slo_e2e_violations = self._counter_cls(
+            name="vllm:slo_e2e_violations_total",
+            documentation="Total requests that missed their E2E SLO.",
+            labelnames=labelnames,
+        )
+        self.counter_slo_e2e_violations = create_metric_per_engine(
+            counter_slo_e2e_violations, per_engine_labelvalues
+        )
+        histogram_slo_ttft_slack = self._histogram_cls(
+            name="vllm:slo_ttft_slack_seconds",
+            documentation=(
+                "TTFT slack in seconds (positive = on time, negative = missed). "
+                "Only recorded for requests with slo_ttft_ms set."
+            ),
+            buckets=slo_slack_buckets,
+            labelnames=labelnames,
+        )
+        self.histogram_slo_ttft_slack = create_metric_per_engine(
+            histogram_slo_ttft_slack, per_engine_labelvalues
+        )
+        histogram_slo_e2e_slack = self._histogram_cls(
+            name="vllm:slo_e2e_slack_seconds",
+            documentation=(
+                "E2E slack in seconds (positive = on time, negative = missed). "
+                "Only recorded for requests with slo_e2e_ms set."
+            ),
+            buckets=slo_slack_buckets,
+            labelnames=labelnames,
+        )
+        self.histogram_slo_e2e_slack = create_metric_per_engine(
+            histogram_slo_e2e_slack, per_engine_labelvalues
+        )
+
         histogram_prefill_kv_computed_request = self._histogram_cls(
             name="vllm:request_prefill_kv_computed_tokens",
             documentation=(
@@ -1214,6 +1266,19 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 self.histogram_max_tokens_request[engine_idx].observe(
                     finished_request.max_tokens_param
                 )
+            # SLO violation counters and slack histograms.
+            if finished_request.ttft_violated:
+                self.counter_slo_ttft_violations[engine_idx].inc()
+            if finished_request.tpot_violated:
+                self.counter_slo_tpot_violations[engine_idx].inc()
+            if finished_request.e2e_violated:
+                self.counter_slo_e2e_violations[engine_idx].inc()
+            if finished_request.ttft_slack_s != 0.0:
+                self.histogram_slo_ttft_slack[engine_idx].observe(
+                    finished_request.ttft_slack_s)
+            if finished_request.e2e_slack_s != 0.0:
+                self.histogram_slo_e2e_slack[engine_idx].observe(
+                    finished_request.e2e_slack_s)
 
     def record_sleep_state(self, sleep: int = 0, level: int = 0):
         awake = 1

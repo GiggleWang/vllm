@@ -413,6 +413,11 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
+
+        # SLO: record wall-clock time before model execution so we can feed
+        # the measured latency back to the latency predictor.
+        _slo_t0 = time.monotonic() if self.scheduler.slo_enabled else None
+
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -422,6 +427,13 @@ class EngineCore:
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+
+        # Feed observed step latency to the predictor for online learning /
+        # logging while the GPU is busy with the next step.
+        if _slo_t0 is not None:
+            _slo_measured_ms = (time.monotonic() - _slo_t0) * 1000.0
+            self.scheduler.slo_record_step_latency(
+                scheduler_output, _slo_measured_ms)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.

@@ -292,6 +292,33 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "if the served model does not use priority scheduling."
         ),
     )
+    slo_ttft_ms: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Target time-to-first-token in milliseconds from request arrival. "
+            "Used by the SLO-aware scheduler (--scheduling-policy slo). "
+            "vLLM extension, not part of the OpenAI API."
+        ),
+    )
+    slo_tpot_ms: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Target max inter-token latency in milliseconds. "
+            "Used by the SLO-aware scheduler (--scheduling-policy slo). "
+            "vLLM extension, not part of the OpenAI API."
+        ),
+    )
+    slo_e2e_ms: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Target wall-clock end-to-end deadline in milliseconds from "
+            "request arrival. Used by the SLO-aware scheduler. "
+            "vLLM extension, not part of the OpenAI API."
+        ),
+    )
     request_id: str = Field(
         default_factory=random_uuid,
         description=(
@@ -521,6 +548,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
             repetition_detection=self.repetition_detection,
+            slo_ttft_ms=self.slo_ttft_ms,
+            slo_tpot_ms=self.slo_tpot_ms,
+            slo_e2e_ms=self.slo_e2e_ms,
         )
 
     @model_validator(mode="before")

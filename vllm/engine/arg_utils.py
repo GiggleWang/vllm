@@ -1310,6 +1310,25 @@ class EngineArgs:
         scheduler_group.add_argument(
             "--stream-interval", **scheduler_kwargs["stream_interval"]
         )
+        scheduler_group.add_argument(
+            "--slo-enable", **scheduler_kwargs["slo_enable"]
+        )
+        scheduler_group.add_argument(
+            "--slo-predictor", **scheduler_kwargs["slo_predictor"]
+        )
+        scheduler_group.add_argument(
+            "--slo-profile-path", **scheduler_kwargs["slo_profile_path"]
+        )
+        scheduler_group.add_argument(
+            "--slo-step-latency-headroom",
+            **scheduler_kwargs["slo_step_latency_headroom"],
+        )
+        scheduler_group.add_argument(
+            "--slo-default-tpot-ms", **scheduler_kwargs["slo_default_tpot_ms"]
+        )
+        scheduler_group.add_argument(
+            "--slo-admission", **scheduler_kwargs["slo_admission"]
+        )
 
         # Compilation arguments
         compilation_kwargs = get_kwargs(CompilationConfig)

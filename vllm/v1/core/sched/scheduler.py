@@ -162,10 +162,36 @@ class Scheduler(SchedulerInterface):
             raise ValueError(
                 f"Unknown scheduling policy: {self.scheduler_config.policy}"
             ) from e
+
+        # SLO scheduling state.
+        self.slo_enabled: bool = self.scheduler_config.slo_enable
+        self._slo_default_tpot_s: float = (
+            self.scheduler_config.slo_default_tpot_ms / 1000.0
+        )
+        if self.slo_enabled:
+            from vllm.v1.core.sched.slo.latency_predictor import (
+                create_latency_predictor,
+            )
+            self.latency_predictor = create_latency_predictor(
+                self.scheduler_config.slo_predictor,
+                self.scheduler_config.slo_profile_path,
+            )
+        else:
+            self.latency_predictor = None
+        # Set of request IDs deferred by spatial scheduling (not free-d from
+        # KV cache; will be attempted again next step).
+        self._slo_deferred_req_ids: set[str] = set()
+
         # Priority queues for requests.
-        self.waiting = create_request_queue(self.policy)
+        self.waiting = create_request_queue(
+            self.policy,
+            default_tpot_s=self._slo_default_tpot_s,
+        )
         # requests skipped in waiting flow due async deps or constraints.
-        self.skipped_waiting = create_request_queue(self.policy)
+        self.skipped_waiting = create_request_queue(
+            self.policy,
+            default_tpot_s=self._slo_default_tpot_s,
+        )
         self.running: list[Request] = []
 
         # The request IDs that are finished in between the previous and the
@@ -364,19 +390,37 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
-        token_budget = self.max_num_scheduled_tokens
+
+        # For logging.
+        scheduled_timestamp = time.monotonic()
+
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
+        elif self.slo_enabled:
+            token_budget = self._compute_slo_token_budget(
+                now=scheduled_timestamp)
+        else:
+            token_budget = self.max_num_scheduled_tokens
+
+        # SLO mode: sort running list by urgency (tightest deadline first)
+        # so the token budget is spent on the most at-risk requests first.
+        self._slo_deferred_req_ids.clear()
+        if self.slo_enabled and self.running:
+            from vllm.v1.core.sched.slo.urgency import request_urgency
+            self.running.sort(
+                key=lambda r: (
+                    request_urgency(r, scheduled_timestamp,
+                                    self._slo_default_tpot_s),
+                    r.arrival_time,
+                )
+            )
 
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
-
-        # For logging.
-        scheduled_timestamp = time.monotonic()
 
         self.kv_cache_manager.new_step_starts()
 
@@ -471,12 +515,26 @@ class Scheduler(SchedulerInterface):
                         break
 
                     # The request cannot be scheduled.
-                    # Preempt the lowest-priority request.
+                    # Preempt the lowest-priority / least-urgent request.
                     if self.policy == SchedulingPolicy.PRIORITY:
                         preempted_req = max(
                             self.running,
                             key=lambda r: (r.priority, r.arrival_time),
                         )
+                    elif self.policy == SchedulingPolicy.SLO:
+                        from vllm.v1.core.sched.slo.urgency import request_urgency
+                        preempted_req = max(
+                            self.running,
+                            key=lambda r: request_urgency(
+                                r, scheduled_timestamp,
+                                self._slo_default_tpot_s),
+                        )
+                    else:
+                        preempted_req = self.running[-1]
+
+                    if self.policy in (
+                        SchedulingPolicy.PRIORITY, SchedulingPolicy.SLO
+                    ):
                         self.running.remove(preempted_req)
                         if preempted_req in scheduled_running_reqs:
                             preempted_req_id = preempted_req.request_id
@@ -562,7 +620,22 @@ class Scheduler(SchedulerInterface):
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
-            step_skipped_waiting = create_request_queue(self.policy)
+            # SLO admission-time preemption: if the most urgent waiting request
+            # has already missed its TTFT deadline and all seq slots are full,
+            # preempt the least-urgent running request to make room.
+            if (
+                self.slo_enabled
+                and self.scheduler_config.slo_admission == "preempt"
+                and len(self.running) == self.max_num_running_reqs
+                and (self.waiting or self.skipped_waiting)
+            ):
+                self._try_preempt_for_urgent_waiting(
+                    scheduled_timestamp, preempted_reqs)
+
+            step_skipped_waiting = create_request_queue(
+                self.policy,
+                default_tpot_s=self._slo_default_tpot_s,
+            )
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
@@ -1577,13 +1650,183 @@ class Scheduler(SchedulerInterface):
         if self.policy == SchedulingPolicy.FCFS:
             return self.skipped_waiting or self.waiting or None
 
-        # PRIORITY mode: compare queue heads when both queues are non-empty.
+        # PRIORITY / SLO mode: compare queue heads when both queues are
+        # non-empty and pick the more urgent one.
         if self.waiting and self.skipped_waiting:
             waiting_req = self.waiting.peek_request()
             skipped_req = self.skipped_waiting.peek_request()
+            if self.policy == SchedulingPolicy.SLO:
+                import time as _time
+                from vllm.v1.core.sched.slo.urgency import request_urgency
+                now = _time.monotonic()
+                u_wait = request_urgency(
+                    waiting_req, now, self._slo_default_tpot_s)
+                u_skip = request_urgency(
+                    skipped_req, now, self._slo_default_tpot_s)
+                return self.waiting if u_wait <= u_skip else self.skipped_waiting
+            # PRIORITY: use Request.__lt__ comparator.
             return self.waiting if waiting_req < skipped_req else self.skipped_waiting
 
         return self.waiting or self.skipped_waiting or None
+
+    # -----------------------------------------------------------------------
+    # SLO scheduling helpers
+    # -----------------------------------------------------------------------
+
+    def _compute_slo_token_budget(self, now: float) -> int:
+        """Return a token budget for this step that fits within the SLO.
+
+        Uses the latency predictor to find the largest number of new tokens
+        such that the predicted step latency does not exceed the tightest
+        per-step slack among running requests with active SLO deadlines.
+
+        Falls back to ``self.max_num_scheduled_tokens`` when no running
+        requests carry SLO constraints.
+        """
+        hard_cap = self.max_num_scheduled_tokens
+        if not self.running or self.latency_predictor is None:
+            return hard_cap
+
+        from vllm.v1.core.sched.slo.urgency import request_urgency
+
+        # Compute tightest slack (seconds) among SLO'd running requests.
+        slacks: list[float] = []
+        for req in self.running:
+            if (req.ttft_deadline_ts is None
+                    and req.tpot_budget_s is None
+                    and req.e2e_deadline_ts is None):
+                continue
+            u = request_urgency(req, now, self._slo_default_tpot_s)
+            tpot_s = (req.tpot_budget_s
+                      if req.tpot_budget_s is not None
+                      else self._slo_default_tpot_s)
+            slack_s = u * max(tpot_s, 1e-6)
+            slacks.append(max(0.0, slack_s))
+
+        if not slacks:
+            return hard_cap
+
+        headroom = self.scheduler_config.slo_step_latency_headroom
+        target_ms = headroom * 1000.0 * min(slacks)
+
+        if target_ms <= 0:
+            # Already overdue; schedule minimum viable batch.
+            return max(len(self.running), 8)
+
+        # Estimate prefill share (proportion of tokens that are prefill).
+        # Approximate: count requests still in prefill.
+        prefill_reqs = sum(
+            1 for r in self.running
+            if r.num_computed_tokens < r.num_prompt_tokens
+        )
+        total_reqs = len(self.running)
+
+        def _predict(budget: int) -> float:
+            est_prefill = int(budget * prefill_reqs / max(total_reqs, 1))
+            return self.latency_predictor.predict(  # type: ignore[union-attr]
+                num_reqs=total_reqs,
+                num_new_tokens=budget,
+                num_prefill_tokens_in_batch=est_prefill,
+            )
+
+        if _predict(hard_cap) <= target_ms:
+            return hard_cap
+
+        floor = max(total_reqs, 8)
+        if _predict(floor) > target_ms:
+            # Even the floor exceeds target; return floor (can't go lower
+            # without skipping running requests entirely).
+            return floor
+
+        # Binary search for the largest budget that fits.
+        lo, hi = floor, hard_cap
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if _predict(mid) <= target_ms:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def _try_preempt_for_urgent_waiting(
+        self,
+        now: float,
+        preempted_reqs: list[Request],
+    ) -> None:
+        """Proactively preempt the least-urgent running request when the
+        most-urgent waiting request has already missed its TTFT deadline.
+
+        At most one preemption per step to avoid cascading evictions.
+        """
+        from vllm.v1.core.sched.slo.urgency import request_urgency
+        import math
+
+        # Find the most urgent waiting request.
+        queue = self._select_waiting_queue_for_scheduling()
+        if queue is None:
+            return
+        wait_req = queue.peek_request()
+        if wait_req.ttft_deadline_ts is None:
+            return
+        if wait_req.ttft_deadline_ts >= now:
+            # Still within TTFT budget; no need to preempt.
+            return
+
+        # Find the least-urgent running request.
+        least_urgent = max(
+            self.running,
+            key=lambda r: request_urgency(r, now, self._slo_default_tpot_s),
+        )
+        # Only preempt if the running request is clearly less urgent than the
+        # waiting one (add a margin to avoid thrashing).
+        u_wait = request_urgency(wait_req, now, self._slo_default_tpot_s)
+        u_run = request_urgency(least_urgent, now, self._slo_default_tpot_s)
+        if u_run <= u_wait + 1.0:
+            # Not significantly less urgent; skip.
+            return
+
+        self.running.remove(least_urgent)
+        self._preempt_request(least_urgent, now)
+        preempted_reqs.append(least_urgent)
+        logger.debug(
+            "SLO admission preempt: evicted %s (U=%.2f) for waiting %s "
+            "(TTFT missed by %.0f ms)",
+            least_urgent.request_id, u_run, wait_req.request_id,
+            (now - wait_req.ttft_deadline_ts) * 1000,
+        )
+
+    def slo_record_step_latency(
+        self,
+        scheduler_output: "SchedulerOutput",
+        measured_ms: float,
+    ) -> None:
+        """Feed a measured step latency sample to the latency predictor.
+
+        Called by the engine core after each ``execute_model`` + ``sample``
+        cycle when SLO scheduling is enabled.
+        """
+        if self.latency_predictor is None:
+            return
+        total_tokens = scheduler_output.total_num_scheduled_tokens
+        num_reqs = len(scheduler_output.num_scheduled_tokens)
+        # Approximate prefill tokens as tokens for requests still in prefill.
+        prefill_tokens = sum(
+            n_tok
+            for req_id, n_tok in scheduler_output.num_scheduled_tokens.items()
+            if (req := self.requests.get(req_id)) is not None
+            and req.num_computed_tokens <= req.num_prompt_tokens
+        )
+        self.latency_predictor.observe(
+            num_reqs=num_reqs,
+            num_new_tokens=total_tokens,
+            num_prefill_tokens_in_batch=prefill_tokens,
+            measured_ms=measured_ms,
+        )
+        logger.debug(
+            "SLO step: measured_ms=%.2f total_tokens=%d num_reqs=%d "
+            "prefill_tokens=%d",
+            measured_ms, total_tokens, num_reqs, prefill_tokens,
+        )
 
     def _handle_stopped_request(self, request: Request) -> bool:
         """Return True if finished (can be False for resumable requests)."""
