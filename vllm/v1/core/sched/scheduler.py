@@ -394,6 +394,23 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
+        # Module B: rank debug + step_id allocation.
+        # Must happen BEFORE _compute_slo_token_budget so Module D can
+        # reuse the same step_id.
+        self._slo_debug_step_id = 0
+        if self.slo_enabled:
+            from vllm.v1.core.sched.slo.debug import get_recorder
+            _rec = get_recorder()
+            if _rec is not None:
+                self._slo_debug_step_id = _rec.next_step_id()
+                _rec.record_rank(
+                    step_id=self._slo_debug_step_id,
+                    now=scheduled_timestamp,
+                    waiting_iter=iter(self.waiting),
+                    running=self.running,
+                    default_tpot_s=self._slo_default_tpot_s,
+                )
+
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
@@ -1684,7 +1701,18 @@ class Scheduler(SchedulerInterface):
         requests carry SLO constraints.
         """
         hard_cap = self.max_num_scheduled_tokens
+        from vllm.v1.core.sched.slo.debug import get_recorder
+        _rec = get_recorder()
+        _step_id = self._slo_debug_step_id
+
         if not self.running or self.latency_predictor is None:
+            if _rec is not None:
+                _rec.record_budget(
+                    step_id=_step_id, hard_cap=hard_cap, returned=hard_cap,
+                    total_reqs=len(self.running), slo_reqs=0,
+                    min_slack_s=float("nan"), target_ms=float("nan"),
+                    pred_at_hard=float("nan"), pred_at_returned=float("nan"),
+                )
             return hard_cap
 
         from vllm.v1.core.sched.slo.urgency import request_urgency
@@ -1703,23 +1731,26 @@ class Scheduler(SchedulerInterface):
             slack_s = u * max(tpot_s, 1e-6)
             slacks.append(max(0.0, slack_s))
 
+        total_reqs = len(self.running)
         if not slacks:
+            if _rec is not None:
+                _rec.record_budget(
+                    step_id=_step_id, hard_cap=hard_cap, returned=hard_cap,
+                    total_reqs=total_reqs, slo_reqs=0,
+                    min_slack_s=float("nan"), target_ms=float("nan"),
+                    pred_at_hard=float("nan"), pred_at_returned=float("nan"),
+                )
             return hard_cap
 
         headroom = self.scheduler_config.slo_step_latency_headroom
-        target_ms = headroom * 1000.0 * min(slacks)
-
-        if target_ms <= 0:
-            # Already overdue; schedule minimum viable batch.
-            return max(len(self.running), 8)
+        min_slack_s = min(slacks)
+        target_ms = headroom * 1000.0 * min_slack_s
 
         # Estimate prefill share (proportion of tokens that are prefill).
-        # Approximate: count requests still in prefill.
         prefill_reqs = sum(
             1 for r in self.running
             if r.num_computed_tokens < r.num_prompt_tokens
         )
-        total_reqs = len(self.running)
 
         def _predict(budget: int) -> float:
             est_prefill = int(budget * prefill_reqs / max(total_reqs, 1))
@@ -1729,24 +1760,42 @@ class Scheduler(SchedulerInterface):
                 num_prefill_tokens_in_batch=est_prefill,
             )
 
-        if _predict(hard_cap) <= target_ms:
-            return hard_cap
+        pred_at_hard = _predict(hard_cap)
 
-        floor = max(total_reqs, 8)
-        if _predict(floor) > target_ms:
-            # Even the floor exceeds target; return floor (can't go lower
-            # without skipping running requests entirely).
-            return floor
-
-        # Binary search for the largest budget that fits.
-        lo, hi = floor, hard_cap
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            if _predict(mid) <= target_ms:
-                lo = mid
+        if target_ms <= 0:
+            # At least one running request has already missed its deadline.
+            # Don't penalize the rest of the batch — letting budget collapse
+            # to a small floor causes a death spiral: low budget → low
+            # throughput → more requests miss → min_slack stays ≤ 0 forever.
+            # The already-missed request can't be saved anyway, so keep
+            # hard_cap and let the EDF sort on the running list prioritize
+            # the remaining at-risk requests.
+            returned = hard_cap
+        elif pred_at_hard <= target_ms:
+            returned = hard_cap
+        else:
+            floor = max(total_reqs, 8)
+            if _predict(floor) > target_ms:
+                returned = floor
             else:
-                hi = mid - 1
-        return lo
+                lo, hi = floor, hard_cap
+                while lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    if _predict(mid) <= target_ms:
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                returned = lo
+
+        if _rec is not None:
+            _rec.record_budget(
+                step_id=_step_id, hard_cap=hard_cap, returned=returned,
+                total_reqs=total_reqs, slo_reqs=len(slacks),
+                min_slack_s=min_slack_s, target_ms=target_ms,
+                pred_at_hard=pred_at_hard,
+                pred_at_returned=_predict(returned),
+            )
+        return returned
 
     def _try_preempt_for_urgent_waiting(
         self,
@@ -1788,12 +1837,25 @@ class Scheduler(SchedulerInterface):
         self.running.remove(least_urgent)
         self._preempt_request(least_urgent, now)
         preempted_reqs.append(least_urgent)
+        ttft_miss_ms = (now - wait_req.ttft_deadline_ts) * 1000.0
         logger.debug(
             "SLO admission preempt: evicted %s (U=%.2f) for waiting %s "
             "(TTFT missed by %.0f ms)",
             least_urgent.request_id, u_run, wait_req.request_id,
-            (now - wait_req.ttft_deadline_ts) * 1000,
+            ttft_miss_ms,
         )
+        from vllm.v1.core.sched.slo.debug import get_recorder
+        _rec = get_recorder()
+        if _rec is not None:
+            _rec.record_preempt(
+                step_id=self._slo_debug_step_id,
+                kind="admission",
+                victim_rid=least_urgent.request_id,
+                victim_u=u_run,
+                waiting_rid=wait_req.request_id,
+                waiting_u=u_wait,
+                ttft_miss_ms=ttft_miss_ms,
+            )
 
     def slo_record_step_latency(
         self,
@@ -1816,12 +1878,30 @@ class Scheduler(SchedulerInterface):
             if (req := self.requests.get(req_id)) is not None
             and req.num_computed_tokens <= req.num_prompt_tokens
         )
+        # Module C: capture predicted-vs-measured BEFORE observe() so we see
+        # the prediction the scheduler actually used this step.
+        predicted_ms = self.latency_predictor.predict(
+            num_reqs=num_reqs,
+            num_new_tokens=total_tokens,
+            num_prefill_tokens_in_batch=prefill_tokens,
+        )
         self.latency_predictor.observe(
             num_reqs=num_reqs,
             num_new_tokens=total_tokens,
             num_prefill_tokens_in_batch=prefill_tokens,
             measured_ms=measured_ms,
         )
+        from vllm.v1.core.sched.slo.debug import get_recorder
+        _rec = get_recorder()
+        if _rec is not None:
+            _rec.record_predict(
+                step_id=self._slo_debug_step_id,
+                num_reqs=num_reqs,
+                num_new_tokens=total_tokens,
+                num_prefill_tokens=prefill_tokens,
+                predicted_ms=predicted_ms,
+                measured_ms=measured_ms,
+            )
         logger.debug(
             "SLO step: measured_ms=%.2f total_tokens=%d num_reqs=%d "
             "prefill_tokens=%d",

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import itertools
+import time
 from http import HTTPStatus
 
 from fastapi import APIRouter, Depends, FastAPI, Request
@@ -28,6 +30,12 @@ logger = init_logger(__name__)
 router = APIRouter()
 ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL = "endpoint-load-metrics-format"
 
+# Tracks how many chat-completion HTTP requests have been accepted by the
+# FastAPI handler. Used for debug logging to distinguish "arrived at server"
+# from "completed by uvicorn" (the access log).
+_chat_request_counter = itertools.count(1)
+_chat_process_start_ts = time.monotonic()
+
 
 def chat(request: Request) -> OpenAIServingChat | None:
     return request.app.state.openai_serving_chat
@@ -51,6 +59,16 @@ def batch_chat(request: Request) -> OpenAIServingChatBatch | None:
 @with_cancellation
 @load_aware_call
 async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
+    # Debug: log every inbound request so we can distinguish "arrived" from
+    # "completed" (the uvicorn access log only fires on response completion).
+    _req_idx = next(_chat_request_counter)
+    _elapsed = time.monotonic() - _chat_process_start_ts
+    _peer = raw_request.client.host if raw_request.client else "?"
+    logger.info(
+        "CHAT RECV #%d  t=%.3fs  from=%s",
+        _req_idx, _elapsed, _peer,
+    )
+
     metrics_header_format = raw_request.headers.get(
         ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, ""
     )

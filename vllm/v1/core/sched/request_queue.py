@@ -200,69 +200,94 @@ class PriorityRequestQueue(RequestQueue):
             yield heapq.heappop(heap_copy)
 
 
+_SLO_RESORT_TTL_S: float = 0.010  # cached sort is reused for up to 10 ms
+
+
 class SLORequestQueue(RequestQueue):
     """An SLO-aware queue ordered by request urgency at peek/pop time.
 
-    Internally stores requests in an unsorted list.  On each ``peek_request``
-    or ``pop_request`` call the list is sorted by
-    ``(urgency, arrival_time, request_id)`` using the current monotonic time.
-    This yields correct EDF-style ordering without requiring a heap whose keys
-    would go stale as time passes.
+    Internally stores requests in an unsorted list.  The list is sorted by
+    ``(urgency, arrival_time, request_id)`` but the sort is cached:
 
-    The list length is bounded by ``max_num_seqs`` (typically a few hundred),
-    so O(N log N) sorting per scheduling step is negligible compared to a GPU
-    forward pass.
+    - A full resort runs when the set of items changes (``_dirty`` set by
+      add/prepend/remove) or when the cached order is older than
+      ``_SLO_RESORT_TTL_S``.
+    - ``pop_request`` removes item 0 without invalidating the cache — the
+      remaining order was still valid at the last sort time, and will be
+      refreshed on the next peek beyond the TTL.
+
+    Without this cache, ``peek_request`` was O(N log N) on every call.  The
+    scheduler calls peek multiple times per step during admission, so the
+    uncached version was O(N² log N) per step once the waiting queue got
+    deep, which starved the forward pass of wall-clock time.
     """
 
     def __init__(self, default_tpot_s: float = 0.05) -> None:
         self._items: list[Request] = []
         self._default_tpot_s = default_tpot_s
+        self._dirty: bool = True
+        self._sorted_at: float = 0.0
 
     def _sort_key(self, req: Request) -> tuple[float, float, str]:
         from vllm.v1.core.sched.slo.urgency import request_urgency
-        now = time.monotonic()
+        # Snapshot ``now`` once per sort, not per key — otherwise each sort
+        # samples a slightly different time, violating the total-order
+        # contract Python's sort requires.
+        now = self._sort_now
         return (
             request_urgency(req, now, self._default_tpot_s),
             req.arrival_time,
             req.request_id,
         )
 
-    def _resort(self) -> None:
+    def _maybe_resort(self) -> None:
+        now = time.monotonic()
+        if not self._dirty and (now - self._sorted_at) < _SLO_RESORT_TTL_S:
+            return
+        self._sort_now = now
         self._items.sort(key=self._sort_key)
+        self._sorted_at = now
+        self._dirty = False
 
     def add_request(self, request: Request) -> None:
         self._items.append(request)
+        self._dirty = True
 
     def pop_request(self) -> Request:
         if not self._items:
             raise IndexError("pop from empty SLORequestQueue")
-        # Do NOT re-sort here.  The scheduler always calls peek_request()
-        # before pop_request() and relies on both returning the same
-        # request.  Re-sorting would change the order because urgency
-        # values depend on time.monotonic() which advances between the
-        # two calls.
+        # Popping item 0 does not invalidate the cached sort; the rest of
+        # the list remains in the order it was sorted into. We deliberately
+        # do NOT re-sort here so peek→pop returns the same request, even
+        # though ``now`` advances between the two calls.
         return self._items.pop(0)
 
     def peek_request(self) -> Request:
         if not self._items:
             raise IndexError("peek from empty SLORequestQueue")
-        self._resort()
+        self._maybe_resort()
         return self._items[0]
 
     def prepend_request(self, request: Request) -> None:
         # In a deadline-ordered queue there is no "front"; just add.
         self._items.append(request)
+        self._dirty = True
 
     def prepend_requests(self, requests: RequestQueue) -> None:
         for req in requests:
             self._items.append(req)
+        self._dirty = True
 
     def remove_request(self, request: Request) -> None:
         self._items.remove(request)
+        # Removing preserves sort order, but conservatively mark dirty in
+        # case callers remove from the middle and then peek immediately.
+        self._dirty = True
 
     def remove_requests(self, requests: Iterable[Request]) -> None:
         to_remove = requests if isinstance(requests, set) else set(requests)
         self._items = [r for r in self._items if r not in to_remove]
+        self._dirty = True
 
     def __bool__(self) -> bool:
         return bool(self._items)
@@ -271,7 +296,7 @@ class SLORequestQueue(RequestQueue):
         return len(self._items)
 
     def __iter__(self) -> Iterator[Request]:
-        self._resort()
+        self._maybe_resort()
         return iter(list(self._items))
 
 

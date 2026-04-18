@@ -824,6 +824,18 @@ class OutputProcessor:
             req_stats=req_state.stats,
             num_cached_tokens=req_state.num_cached_tokens,
         )
+        # Module F: per-request outcome debug (no-op unless VLLM_SLO_DEBUG_DIR).
+        from vllm.v1.core.sched.slo.debug import get_recorder
+        _rec = get_recorder()
+        if _rec is not None and iteration_stats.finished_requests:
+            _rec.record_finish(
+                request_id=req_state.request_id,
+                req_stats=req_state.stats,
+                finished_stats=iteration_stats.finished_requests[-1],
+                num_prompt_tokens=req_state.prompt_len,
+                num_output_tokens=req_state.stats.num_generation_tokens,
+                num_preemptions=getattr(req_state.stats, "num_preemptions", 0),
+            )
         self.lora_states.request_finished(req_state.request_id, req_state.lora_name)
 
         ParentRequest.observe_finished_request(

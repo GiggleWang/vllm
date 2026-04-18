@@ -186,19 +186,29 @@ class OfflineProfilePredictor(LatencyPredictor):
 # ---------------------------------------------------------------------------
 
 _WARMUP_SAMPLES: int = 32
-_EMA_ALPHA: float = 0.05  # weight of new sample; 1-alpha for old estimate
+_NLMS_STEP_SIZE: float = 0.2     # NLMS µ; convergent for µ in (0, 2)
+_NLMS_EPSILON: float = 1.0       # regularization to avoid div-by-zero
+_PRED_CLIP_MS: float = 10_000.0  # sane upper bound for one forward step
+_WEIGHT_CLIP: float = 1000.0     # absolute magnitude cap per coefficient
 
 
 class OnlinePredictor(LatencyPredictor):
-    """EMA-updated linear regression predictor.
+    """NLMS-updated linear regression predictor.
 
     Uses ``HeuristicPredictor`` during a warm-up phase (first
-    ``WARMUP_SAMPLES`` observations).  After that, maintains an affine model
-    fitted online via exponential moving average updates on the coefficient
-    vector.
+    ``_WARMUP_SAMPLES`` observations).  After that, maintains an affine model
+    fitted online via Normalized LMS (NLMS) updates.
 
     The feature vector is ``[1, num_reqs, num_new_tokens, num_prefill_tokens]``
-    and the target is ``measured_ms``.
+    which spans ~4 orders of magnitude. Plain SGD diverges on mixed-scale
+    features (a single gradient step on num_tokens=4096 can move the weight
+    by thousands). NLMS divides the update by the feature vector's squared
+    norm, making convergence independent of feature scale:
+
+        w ← w + µ · (meas − pred) · x / (‖x‖² + ε)
+
+    Predictions and weights are also clipped to defensive bounds so a single
+    pathological sample can't push the model into an unrecoverable state.
 
     Thread safety: no locks — the scheduler loop is single-threaded.
     """
@@ -223,6 +233,9 @@ class OnlinePredictor(LatencyPredictor):
         return [1.0, float(num_reqs), float(num_new_tokens),
                 float(num_prefill_tokens_in_batch)]
 
+    def _raw_predict(self, x: list[float]) -> float:
+        return sum(w * xi for w, xi in zip(self._w, x))
+
     def predict(
         self,
         *,
@@ -237,7 +250,17 @@ class OnlinePredictor(LatencyPredictor):
                 num_prefill_tokens_in_batch=num_prefill_tokens_in_batch,
             )
         x = self._features(num_reqs, num_new_tokens, num_prefill_tokens_in_batch)
-        return sum(w * xi for w, xi in zip(self._w, x))
+        pred = self._raw_predict(x)
+        if not math.isfinite(pred):
+            return self._warmup.predict(
+                num_reqs=num_reqs,
+                num_new_tokens=num_new_tokens,
+                num_prefill_tokens_in_batch=num_prefill_tokens_in_batch,
+            )
+        # Clip to a physically plausible range; scheduler callers treat the
+        # return value as a time budget constraint, so negative or absurd
+        # values are never useful.
+        return max(0.0, min(pred, _PRED_CLIP_MS))
 
     def observe(
         self,
@@ -247,15 +270,29 @@ class OnlinePredictor(LatencyPredictor):
         num_prefill_tokens_in_batch: int,
         measured_ms: float,
     ) -> None:
-        if math.isnan(measured_ms) or measured_ms <= 0:
+        if not math.isfinite(measured_ms) or measured_ms <= 0:
             return
         self._n_samples += 1
         x = self._features(num_reqs, num_new_tokens, num_prefill_tokens_in_batch)
-        pred = sum(w * xi for w, xi in zip(self._w, x))
-        error = measured_ms - pred
-        # Gradient descent step: w_i += alpha * error * x_i
+        pred = self._raw_predict(x)
+        if not math.isfinite(pred):
+            # Weights got pushed into nan/inf by a prior pathological sample.
+            # Reset to heuristic defaults rather than propagating garbage.
+            self._w = [
+                _DEFAULT_BASE_MS, _DEFAULT_COEF_REQS,
+                _DEFAULT_COEF_TOKENS, _DEFAULT_COEF_PREFILL,
+            ]
+            return
+        # Clip the effective prediction before computing error, so a single
+        # far-out sample can't inject a massive gradient.
+        pred_for_err = max(0.0, min(pred, _PRED_CLIP_MS))
+        error = measured_ms - pred_for_err
+        # NLMS: divide the LMS update by the squared feature norm.
+        x_norm_sq = sum(xi * xi for xi in x) + _NLMS_EPSILON
+        scale = _NLMS_STEP_SIZE * error / x_norm_sq
         self._w = [
-            w + _EMA_ALPHA * error * xi for w, xi in zip(self._w, x)
+            max(-_WEIGHT_CLIP, min(_WEIGHT_CLIP, w + scale * xi))
+            for w, xi in zip(self._w, x)
         ]
 
 

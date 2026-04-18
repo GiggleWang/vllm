@@ -194,6 +194,12 @@ class Request:
         # Updated by the scheduler each time a new output token is produced.
         self.last_token_mono_ts: float | None = None
 
+        # Module A: ingress debug (no-op unless VLLM_SLO_DEBUG_DIR is set).
+        from vllm.v1.core.sched.slo.debug import get_recorder
+        _rec = get_recorder()
+        if _rec is not None:
+            _rec.record_ingress(self)
+
     @classmethod
     def from_engine_core_request(
         cls,

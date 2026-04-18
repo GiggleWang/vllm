@@ -483,6 +483,11 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
+            # SLO: wall-clock time before model execution, for latency
+            # predictor observation at pop time.
+            _slo_t0 = (
+                time.monotonic() if self.scheduler.slo_enabled else None
+            )
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -510,7 +515,9 @@ class EngineCore:
 
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
-                batch_queue.appendleft((future, scheduler_output, exec_future))
+                batch_queue.appendleft(
+                    (future, scheduler_output, exec_future, _slo_t0)
+                )
                 if (
                     model_executed
                     and len(batch_queue) < self.batch_queue_size
@@ -527,7 +534,9 @@ class EngineCore:
             return None, False
 
         # Block until the next result is available.
-        future, scheduler_output, exec_model_fut = batch_queue.pop()
+        future, scheduler_output, exec_model_fut, _slo_t0_popped = (
+            batch_queue.pop()
+        )
         with (
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
@@ -538,6 +547,13 @@ class EngineCore:
                 # call failed - raise that exception.
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
+
+        # SLO: feed measured step latency back to the predictor.
+        if _slo_t0_popped is not None:
+            _slo_measured_ms = (time.monotonic() - _slo_t0_popped) * 1000.0
+            self.scheduler.slo_record_step_latency(
+                scheduler_output, _slo_measured_ms
+            )
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -568,7 +584,12 @@ class EngineCore:
                 deferred_scheduler_output
             )
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
-            batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
+            # Deferred sampling path: skip SLO timing (spec decode + structured
+            # output is a rare combination; the extra bookkeeping isn't worth
+            # distorting the observation window).
+            batch_queue.appendleft(
+                (future, deferred_scheduler_output, exec_future, None)
+            )
 
         return engine_core_outputs, model_executed
 
