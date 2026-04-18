@@ -236,7 +236,11 @@ class SLORequestQueue(RequestQueue):
     def pop_request(self) -> Request:
         if not self._items:
             raise IndexError("pop from empty SLORequestQueue")
-        self._resort()
+        # Do NOT re-sort here.  The scheduler always calls peek_request()
+        # before pop_request() and relies on both returning the same
+        # request.  Re-sorting would change the order because urgency
+        # values depend on time.monotonic() which advances between the
+        # two calls.
         return self._items.pop(0)
 
     def peek_request(self) -> Request:

@@ -43,9 +43,9 @@ from typing import Any
 # Grid definition
 # ---------------------------------------------------------------------------
 
-_NUM_REQS_GRID = [1, 2, 4, 8, 16, 32]
-_NUM_TOKENS_GRID = [1, 8, 64, 256, 1024, 2048]
-_PREFILL_SHARE_GRID = [0.0, 0.5, 1.0]
+_NUM_REQS_GRID = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+_NUM_TOKENS_GRID = [1, 8, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+_PREFILL_SHARE_GRID = [0.0, 0.25, 0.5, 0.75, 1.0]
 
 _WARMUP_STEPS = 5
 _MEASURE_STEPS = 20
@@ -146,6 +146,14 @@ def _run_profiling(
     total = len(grid)
 
     for idx, (num_reqs, num_tokens, prefill_share) in enumerate(grid):
+        # Skip if num_tokens < num_reqs: in real serving each request
+        # produces at least 1 token per step, so this combination
+        # cannot occur and would record misleading features.
+        if num_tokens < num_reqs:
+            print(f"  [{idx+1}/{total}] Skipping num_reqs={num_reqs} "
+                  f"num_tokens={num_tokens}: num_tokens < num_reqs")
+            continue
+
         # Skip if total tokens would exceed model capacity.
         tokens_per_req = max(1, num_tokens // num_reqs)
         if tokens_per_req > max_model_len - 1:
