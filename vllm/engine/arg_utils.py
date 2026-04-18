@@ -634,6 +634,13 @@ class EngineArgs:
 
     stream_interval: int = SchedulerConfig.stream_interval
 
+    slo_enable: bool = SchedulerConfig.slo_enable
+    slo_predictor: str = SchedulerConfig.slo_predictor
+    slo_profile_path: str | None = SchedulerConfig.slo_profile_path
+    slo_step_latency_headroom: float = SchedulerConfig.slo_step_latency_headroom
+    slo_default_tpot_ms: int = SchedulerConfig.slo_default_tpot_ms
+    slo_admission: str = SchedulerConfig.slo_admission
+
     kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
     optimization_level: OptimizationLevel = VllmConfig.optimization_level
     performance_mode: PerformanceMode = VllmConfig.performance_mode
@@ -1935,6 +1942,12 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
+            slo_enable=self.slo_enable,
+            slo_predictor=self.slo_predictor,
+            slo_profile_path=self.slo_profile_path,
+            slo_step_latency_headroom=self.slo_step_latency_headroom,
+            slo_default_tpot_ms=self.slo_default_tpot_ms,
+            slo_admission=self.slo_admission,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:
